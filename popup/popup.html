@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Local Tab Audio Boost</title>
+<link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+<main class="popup">
+  <header class="popup__header">
+    <img src="../icons/icon32.png" alt="" width="20" height="20" />
+    <h1>Local Tab Audio Boost</h1>
+  </header>
+
+  <p id="page-url" class="popup__url" title=""></p>
+  <p id="status-line" class="popup__status" role="status"></p>
+
+  <div id="slider-area">
+    <div id="percent-display" class="popup__percent" aria-hidden="true">100%</div>
+
+    <label class="popup__slider-label" for="gain-slider">Volume</label>
+    <input
+      id="gain-slider"
+      type="range"
+      min="0"
+      max="300"
+      step="1"
+      value="100"
+      aria-label="Boost volume, 0 to 300 percent"
+    />
+    <div class="popup__slider-scale" aria-hidden="true">
+      <span>0%</span>
+      <span>100%</span>
+      <span>200%</span>
+      <span>300%</span>
+    </div>
+  </div>
+
+  <div class="popup__controls">
+    <button id="add-button" type="button" class="popup__button popup__button--secondary">Add this page</button>
+    <button id="manual-add-button" type="button" class="popup__button popup__button--secondary">Add URL manually</button>
+    <button id="saved-pages-button" type="button" class="popup__button popup__button--secondary">Saved pages</button>
+    <button id="toggle-button" type="button" class="popup__button popup__button--primary">Enable boosting</button>
+  </div>
+
+  <p id="message-area" class="popup__message" role="status"></p>
+</main>
+
+<div id="manual-add-overlay" class="popup__overlay" hidden>
+  <div class="popup__modal" role="dialog" aria-modal="true" aria-labelledby="manual-add-title">
+    <h2 id="manual-add-title">Add URL manually</h2>
+
+    <label class="popup__modal-label" for="manual-url-input">Exact URL</label>
+    <input
+      id="manual-url-input"
+      type="text"
+      inputmode="url"
+      placeholder="https://example.com/path"
+      autocomplete="off"
+    />
+
+    <label class="popup__modal-label" for="manual-volume-input">
+      Initial volume: <span id="manual-volume-display">100%</span>
+    </label>
+    <input
+      id="manual-volume-input"
+      type="range"
+      min="0"
+      max="300"
+      step="1"
+      value="100"
+      aria-label="Initial volume, 0 to 300 percent"
+    />
+
+    <p id="manual-add-error" class="popup__error" role="alert"></p>
+
+    <div class="popup__modal-actions">
+      <button id="manual-add-cancel" type="button" class="popup__button popup__button--secondary">Cancel</button>
+      <button id="manual-add-save" type="button" class="popup__button popup__button--primary">Save</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="popup.js"></script>
+</body>
+</html>

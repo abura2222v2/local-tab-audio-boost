@@ -1,0 +1,15 @@
+# Dependencies / VCS internals
+node_modules/
+.git/
+
+# Archives and checksums (never source)
+*.zip
+*.sha256
+
+# Generated validation logs
+test-output*.txt
+audit-output*.txt
+node-check-output*.txt
+
+# OS cruft
+.DS_Store

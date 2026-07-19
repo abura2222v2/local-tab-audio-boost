@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Local Tab Audio Boost",
+  "version": "0.1.0",
+  "description": "Temporarily boost the current tab's audio up to 300% after an explicit click. Fully local, no network access. Saving a page's preferred volume is optional and never auto-starts boosting.",
+  "minimum_chrome_version": "116",
+  "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "webNavigation"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "options/options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

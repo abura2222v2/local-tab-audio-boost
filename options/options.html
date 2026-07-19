@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Local Tab Audio Boost - Saved pages</title>
+<link rel="stylesheet" href="options.css" />
+</head>
+<body>
+<main class="options">
+  <h1>Saved pages</h1>
+
+  <p class="options__warning" role="note">
+    Exact page addresses are stored locally. Avoid adding URLs that contain passwords,
+    access tokens, or other secrets.
+  </p>
+
+  <p class="options__note" role="note">
+    Saving a page only stores its exact URL and a preferred volume - it never starts
+    boosting on its own. Use the popup's <strong>Enable boosting</strong> button (or its
+    slider) on the page itself to actually start a session. To save a new page, open the
+    popup on that page and use <strong>Add this page</strong> or <strong>Add URL manually</strong>.
+  </p>
+
+  <p id="list-error" class="options__error" role="alert"></p>
+
+  <ul id="page-list" class="options__list" aria-label="Saved pages"></ul>
+
+  <p id="empty-state" class="options__empty" hidden>No pages are saved yet.</p>
+
+  <div class="options__clear-row">
+    <button id="clear-button" type="button" class="options__button options__button--secondary">
+      Clear all saved pages
+    </button>
+    <div id="clear-confirm" class="options__clear-confirm" hidden>
+      <span>Are you sure? This removes every saved page.</span>
+      <button id="clear-confirm-yes" type="button" class="options__button options__button--danger">Yes, clear all</button>
+      <button id="clear-confirm-cancel" type="button" class="options__button options__button--secondary">Cancel</button>
+    </div>
+  </div>
+</main>
+<script type="module" src="options.js"></script>
+</body>
+</html>
