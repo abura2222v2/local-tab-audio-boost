@@ -1,6 +1,7 @@
 import { TARGETS, MESSAGE_TYPES, MIN_GAIN_PERCENT, MAX_GAIN_PERCENT } from '../shared/constants.js';
 import { registerMessageHandler, sendMessage, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
 import { createPopupController } from '../shared/popup-controller.js';
+import { createManualAddModalController } from '../shared/manual-add-modal.js';
 
 const els = {
   pageUrl: document.getElementById('page-url'),
@@ -15,6 +16,7 @@ const els = {
   toggleButton: document.getElementById('toggle-button'),
   messageArea: document.getElementById('message-area'),
   manualAddOverlay: document.getElementById('manual-add-overlay'),
+  manualModalPanel: document.querySelector('#manual-add-overlay .popup__modal'),
   manualUrlInput: document.getElementById('manual-url-input'),
   manualVolumeInput: document.getElementById('manual-volume-input'),
   manualVolumeDisplay: document.getElementById('manual-volume-display'),
@@ -177,47 +179,65 @@ els.savedPagesButton.addEventListener('click', () => {
 });
 
 // --- Add URL manually modal ---
+//
+// The overlay's `hidden` attribute is the authoritative visibility state
+// (popup.css turns it into `display: none !important`). The pure controller
+// in shared/manual-add-modal.js owns the open/close/save/escape/overlay
+// transitions; this popup only wires DOM events to it and provides the
+// field-reset and submit behavior. The modal is NEVER opened at startup - it
+// starts hidden via the static HTML `hidden` attribute and opens only from
+// the "Add URL manually" button below.
+const manualModal = createManualAddModalController({
+  modal: els.manualAddOverlay,
+  resetFields: () => {
+    els.manualUrlInput.value = '';
+    els.manualVolumeInput.value = '100';
+    els.manualVolumeDisplay.textContent = '100%';
+    els.manualAddError.textContent = ''; // reopening always clears stale error text
+  },
+  submit: async () => {
+    const rawUrl = els.manualUrlInput.value.trim();
+    els.manualAddError.textContent = '';
+    if (!rawUrl) {
+      els.manualAddError.textContent = 'Enter a URL.';
+      return { ok: false };
+    }
+    // Saving never opens the page, never captures a tab, and never grants a
+    // domain-wide permission - it is a storage-only write, validated and
+    // performed exclusively by the service worker.
+    const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.ADD_PAGE_MANUAL, {
+      rawUrl,
+      gainPercent: Number(els.manualVolumeInput.value),
+    });
+    if (!response.ok) {
+      els.manualAddError.textContent = response.error?.message ?? 'That URL could not be added.';
+      return { ok: false };
+    }
+    await refresh();
+    return { ok: true };
+  },
+});
 
-function openManualAddModal() {
-  els.manualUrlInput.value = '';
-  els.manualVolumeInput.value = '100';
-  els.manualVolumeDisplay.textContent = '100%';
-  els.manualAddError.textContent = '';
-  els.manualAddOverlay.hidden = false;
+els.manualAddButton.addEventListener('click', () => {
+  manualModal.open();
   els.manualUrlInput.focus();
-}
-
-function closeManualAddModal() {
-  els.manualAddOverlay.hidden = true;
-}
-
-els.manualAddButton.addEventListener('click', openManualAddModal);
-els.manualAddCancel.addEventListener('click', closeManualAddModal);
+});
+els.manualAddCancel.addEventListener('click', () => manualModal.close());
+els.manualAddSave.addEventListener('click', () => manualModal.save());
 
 els.manualVolumeInput.addEventListener('input', () => {
   els.manualVolumeDisplay.textContent = `${els.manualVolumeInput.value}%`;
 });
 
-els.manualAddSave.addEventListener('click', async () => {
-  const rawUrl = els.manualUrlInput.value.trim();
-  els.manualAddError.textContent = '';
-  if (!rawUrl) {
-    els.manualAddError.textContent = 'Enter a URL.';
-    return;
-  }
-  // Saving never opens the page, never captures a tab, and never grants a
-  // domain-wide permission - it is a storage-only write, validated and
-  // performed exclusively by the service worker.
-  const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.ADD_PAGE_MANUAL, {
-    rawUrl,
-    gainPercent: Number(els.manualVolumeInput.value),
-  });
-  if (!response.ok) {
-    els.manualAddError.textContent = response.error?.message ?? 'That URL could not be added.';
-    return;
-  }
-  closeManualAddModal();
-  await refresh();
+// Escape closes the modal (only while it is open).
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') manualModal.onEscape();
+});
+
+// A click on the overlay backdrop closes the modal; a click inside the modal
+// panel does not.
+els.manualAddOverlay.addEventListener('mousedown', (event) => {
+  manualModal.onOverlayPointerDown(event.target, els.manualModalPanel);
 });
 
 window.addEventListener('pagehide', () => controller.flushFallback());

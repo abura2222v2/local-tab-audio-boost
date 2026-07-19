@@ -27,6 +27,20 @@
   box-sizing: border-box;
 }
 
+/*
+ * Authoritative visibility rule. The HTML `hidden` attribute is the single
+ * source of truth for whether the "Add URL manually" overlay is shown. This
+ * MUST use !important because `.popup__overlay` (below) sets `display: flex`
+ * for the visible state, and an author `display` rule would otherwise win
+ * over the browser's default `[hidden] { display: none }`, leaving the modal
+ * on screen even when `hidden` is set. With this rule, a `hidden` element is
+ * always removed from layout; removing `hidden` lets `.popup__overlay`'s
+ * `display: flex` take effect again for the visible state.
+ */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;

@@ -218,3 +218,15 @@ automatically for you.
 - To remove everything, including the extension itself: go to
   `chrome://extensions`, find this extension, and click **Remove**. This
   deletes its `chrome.storage.local` data along with it.
+
+## Changelog
+
+### 0.1.1
+
+- Fixed the **Add URL manually** modal: it no longer opens automatically when
+  the popup is opened, and it now closes correctly on **Cancel**, on a
+  successful **Save**, on **Escape**, and on clicking the backdrop outside the
+  panel (clicking inside the panel keeps it open). A failed validation or save
+  keeps it open and shows the error. The root cause was a popup stylesheet
+  rule that overrode the `hidden` attribute; the `hidden` attribute is now the
+  authoritative visibility state.
