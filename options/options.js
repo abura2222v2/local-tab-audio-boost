@@ -7,6 +7,8 @@
 
 import { TARGETS, MESSAGE_TYPES, MIN_GAIN_PERCENT, MAX_GAIN_PERCENT } from '../shared/constants.js';
 import { registerMessageHandler, sendMessage, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
+import { createSavedPageSliderController } from '../shared/saved-page-slider.js';
+import { createClearConfirmController } from '../shared/clear-confirm.js';
 
 const els = {
   list: document.getElementById('page-list'),
@@ -18,8 +20,20 @@ const els = {
   clearConfirmCancel: document.getElementById('clear-confirm-cancel'),
 };
 
+// One entry per currently-rendered row, keyed by its exact pageKey. Lets an
+// incoming SAVED_PAGE_LIVE_GAIN_CHANGED broadcast (the popup slider driving a
+// live gain) move ONLY the matching exact row, without a full re-render, and
+// lets renderList() dispose the previous rows' throttle timers.
+const rows = new Map(); // pageKey -> { slider, volumeSpan, controller }
+
+function disposeRows() {
+  for (const row of rows.values()) row.controller.dispose();
+  rows.clear();
+}
+
 function renderList(savedPages) {
   const entries = Object.entries(savedPages).sort(([a], [b]) => a.localeCompare(b));
+  disposeRows();
   els.list.textContent = '';
   els.emptyState.hidden = entries.length > 0;
 
@@ -45,27 +59,42 @@ function renderList(savedPages) {
     volumeSpan.className = 'options__volume';
     volumeSpan.textContent = `${volumePercent}%`;
 
-    // `input` (continuous, while dragging) only updates the on-screen
-    // number - it never writes storage. `change` (once, on commit) is the
-    // only thing that sends UPDATE_SAVED_PAGE_VOLUME - this updates ONLY
-    // this exact URL's saved default, and only after a failed live update
-    // is the list re-fetched to recover the authoritative on-screen state
-    // (the stored value itself is never corrupted by a failed live
-    // propagation - see handleUpdateSavedPageVolume in service-worker.js).
+    // The pure, DOM-free controller owns the live-vs-persist timing for THIS
+    // exact row (see shared/saved-page-slider.js):
+    //  - `input` (while dragging) drives a THROTTLED, LIVE-ONLY gain to the
+    //    service worker (SET_SAVED_PAGE_LIVE_GAIN) - it changes the audio of
+    //    any tab currently boosting this identical exact URL, but writes
+    //    NOTHING to storage;
+    //  - `change` (on release) flushes the final live value, then persists it
+    //    exactly once through UPDATE_SAVED_PAGE_VOLUME. Only after a failed
+    //    persist is the list re-fetched to recover the authoritative on-screen
+    //    state (the stored value itself is never corrupted by a failed live
+    //    propagation - see handleUpdateSavedPageVolume in service-worker.js).
+    const controller = createSavedPageSliderController({
+      sendLiveGain: (value) => {
+        sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: value });
+      },
+      persist: async (value) => {
+        const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, {
+          pageKey,
+          gainPercent: value,
+        });
+        if (!response.ok) {
+          els.listError.textContent = response.error?.message ?? "Could not update this page's volume.";
+          await refresh();
+          return response;
+        }
+        els.listError.textContent = '';
+        return response;
+      },
+    });
+
     slider.addEventListener('input', () => {
       volumeSpan.textContent = `${slider.value}%`;
+      controller.onInput(Number(slider.value));
     });
-    slider.addEventListener('change', async () => {
-      const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, {
-        pageKey,
-        gainPercent: Number(slider.value),
-      });
-      if (!response.ok) {
-        els.listError.textContent = response.error?.message ?? "Could not update this page's volume.";
-        await refresh();
-        return;
-      }
-      els.listError.textContent = '';
+    slider.addEventListener('change', () => {
+      controller.onChange(Number(slider.value));
     });
 
     const removeButton = document.createElement('button');
@@ -77,7 +106,21 @@ function renderList(savedPages) {
 
     item.append(keySpan, slider, volumeSpan, removeButton);
     els.list.append(item);
+    rows.set(pageKey, { slider, volumeSpan, controller });
   }
+}
+
+/**
+ * Moves ONLY the matching exact row's slider + percentage to a live gain
+ * driven by the popup slider (a SAVED_PAGE_LIVE_GAIN_CHANGED broadcast). It
+ * never persists and never re-renders the whole list; a pageKey with no
+ * currently-rendered row (e.g. an unsaved page) is a harmless no-op.
+ */
+function applyLiveGainToRow(pageKey, gainPercent) {
+  const row = rows.get(pageKey);
+  if (!row) return;
+  row.slider.value = String(gainPercent);
+  row.volumeSpan.textContent = `${gainPercent}%`;
 }
 
 async function refresh() {
@@ -99,30 +142,42 @@ async function removePage(pageKey) {
   await refresh();
 }
 
-els.clearButton.addEventListener('click', () => {
-  els.clearConfirm.hidden = false;
-  els.clearButton.hidden = true;
+// The "Clear all" confirmation starts hidden (its `hidden` attribute is set in
+// the static HTML and turned into `display: none !important` by options.css).
+// The pure controller in shared/clear-confirm.js owns the show/cancel/confirm/
+// escape transitions; a FAILED clear keeps the confirmation visible and shows
+// the real error rather than dismissing itself.
+const clearConfirm = createClearConfirmController({
+  confirmEl: els.clearConfirm,
+  clearButtonEl: els.clearButton,
+  performClear: () => sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.CLEAR_SAVED_PAGES, {}),
+  showError: (message) => {
+    els.listError.textContent = message;
+  },
 });
 
-els.clearConfirmCancel.addEventListener('click', () => {
-  els.clearConfirm.hidden = true;
-  els.clearButton.hidden = false;
-});
-
+els.clearButton.addEventListener('click', () => clearConfirm.show());
+els.clearConfirmCancel.addEventListener('click', () => clearConfirm.hide());
 els.clearConfirmYes.addEventListener('click', async () => {
-  els.clearConfirm.hidden = true;
-  els.clearButton.hidden = false;
-  const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.CLEAR_SAVED_PAGES, {});
-  if (!response.ok) {
-    els.listError.textContent = response.error?.message ?? 'Could not clear saved pages.';
-    return;
+  const result = await clearConfirm.confirm();
+  if (result.ok) {
+    els.listError.textContent = '';
+    await refresh();
   }
-  await refresh();
+});
+
+// Escape closes the confirmation (only while it is open).
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') clearConfirm.onEscape();
 });
 
 async function handleOptionsMessage(message) {
   if (message.type === MESSAGE_TYPES.SAVED_PAGES_CHANGED) {
     renderList(message.payload?.savedPages ?? {});
+  } else if (message.type === MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED) {
+    // The popup slider is driving a live gain for one exact page - move just
+    // that row (never persists, never re-renders the whole list).
+    applyLiveGainToRow(message.payload?.pageKey, message.payload?.gainPercent);
   }
   return { ok: true, data: {} };
 }
@@ -131,5 +186,8 @@ async function handleOptionsMessage(message) {
 // see validateServiceWorkerOriginatedSender's own doc comment in
 // shared/messages.js for exactly what is and isn't trusted here.
 registerMessageHandler(TARGETS.OPTIONS, handleOptionsMessage, { validateSender: validateServiceWorkerOriginatedSender });
+
+// A closing options page must not leave a row's trailing throttle timer armed.
+window.addEventListener('pagehide', disposeRows);
 
 refresh();

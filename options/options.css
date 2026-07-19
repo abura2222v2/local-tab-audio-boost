@@ -31,6 +31,18 @@
   box-sizing: border-box;
 }
 
+/*
+ * The `hidden` attribute is the single authoritative visibility state for the
+ * empty-state note and the "Clear all" confirmation. Author rules like
+ * `.options__clear-confirm { display: flex }` below would otherwise override
+ * the browser's default `[hidden] { display: none }` and leave the
+ * confirmation permanently on screen, so this makes the hide win with
+ * `!important`. No `[hidden]` state may set a visible `display`.
+ */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;

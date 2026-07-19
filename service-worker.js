@@ -708,6 +708,24 @@ async function broadcastSavedPageChangedToPopup(pageKey) {
   }
 }
 
+/**
+ * Narrowly-scoped LIVE-gain notice to any open Saved-pages/options view that
+ * ONE exact pageKey's live gain changed while the POPUP slider was driving an
+ * active session (see handleSetTabGain). An open Saved-pages view moves only
+ * the matching exact row's slider + percentage in real time; it never
+ * persists and no other row is touched. Carries just the pageKey + the
+ * already-confirmed, already-clamped gainPercent (never the whole map). For an
+ * unsaved page the options view has no matching row, so this is a harmless
+ * no-op there - it can never create a saved entry.
+ */
+async function broadcastSavedPageLiveGainToOptions(pageKey, gainPercent) {
+  try {
+    await sendMessage(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED, { pageKey, gainPercent });
+  } catch {
+    // Best-effort only - the saved-pages view may not be open.
+  }
+}
+
 function staleResult() {
   return { ok: false, error: { code: ERROR_CODES.ALREADY_IN_PROGRESS, message: 'This operation was cancelled.' } };
 }
@@ -1039,6 +1057,31 @@ async function handleUpdateSavedPageVolume({ pageKey, gainPercent }) {
 }
 
 /**
+ * The saved-pages view's LIVE (non-persisting) row-slider drag. Sent
+ * throttled while a row slider is moved, before the final value is committed
+ * (separately) via UPDATE_SAVED_PAGE_VOLUME on release. This handler NEVER
+ * writes storage and NEVER starts a capture session - it only propagates the
+ * new gain to any currently active session(s) sharing the identical exact
+ * pageKey, through the same confirmed, operation-scoped offscreen update that
+ * every other live-gain path uses (see propagateGainToSessionsSharingPageKey:
+ * a failed/stale update never falsely marks a session's cache updated, and
+ * only a positively confirmed change broadcasts TAB_STATE_CHANGED so an open
+ * popup on that exact active tab moves its slider in real time). If no session
+ * is active for this pageKey, it is simply a no-op - no different path, query,
+ * fragment, scheme, port, hostname, or subdomain is ever affected, because
+ * propagation is gated on exact pageKey equality.
+ */
+async function handleSavedPageLiveGain({ pageKey, gainPercent }) {
+  await ensureReconciled();
+  const clamped = clampGainPercent(gainPercent);
+  if (clamped === null) {
+    return { ok: false, error: { code: ERROR_CODES.INVALID_MESSAGE, message: 'Invalid gain value.' } };
+  }
+  await propagateGainToSessionsSharingPageKey(pageKey, clamped);
+  return { ok: true, data: { pageKey, gainPercent: clamped } };
+}
+
+/**
  * Registers `{operationId, pageKey:null, state:'resolving'}` in the cache
  * BEFORE resolving the tab's URL - specifically so a navigation/Stop/close
  * event arriving *during* the chrome.tabs.get call has something to
@@ -1181,6 +1224,13 @@ async function handleSetTabGain({ tabId, gainPercent, expectedOperationId }) {
   const current = sessions.get(tabId);
   if (current && current.operationId === operationId) {
     current.gainPercent = clamped;
+    // The popup slider just drove this active session's live gain. Notify any
+    // open Saved-pages view so the matching exact row's slider + percentage
+    // move in real time - narrowly scoped to this session's immutable pageKey,
+    // never persisting anything. A stale/unconfirmed response never reaches
+    // here (the confirmation gate above already returned), so a Saved-pages
+    // row is only ever moved by a live gain the offscreen document confirmed.
+    broadcastSavedPageLiveGainToOptions(current.pageKey, clamped);
   }
   return { ok: true, data: { tabId, gainPercent: clamped } };
 }
@@ -1275,6 +1325,8 @@ async function handleMessage(message) {
       return handleClearSavedPages();
     case MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME:
       return handleUpdateSavedPageVolume(message.payload);
+    case MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN:
+      return handleSavedPageLiveGain(message.payload);
     case MESSAGE_TYPES.START_CAPTURE:
       return handleStartCapture(message.payload);
     case MESSAGE_TYPES.STOP_CAPTURE:
@@ -1315,6 +1367,7 @@ const OPTIONS_ONLY_MESSAGE_TYPES = new Set([
   MESSAGE_TYPES.REMOVE_SAVED_PAGE,
   MESSAGE_TYPES.CLEAR_SAVED_PAGES,
   MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME,
+  MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN,
 ]);
 const OFFSCREEN_ONLY_MESSAGE_TYPES = new Set([MESSAGE_TYPES.SESSION_STOPPED, MESSAGE_TYPES.SESSION_ERROR]);
 

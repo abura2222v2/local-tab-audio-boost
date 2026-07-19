@@ -4508,3 +4508,249 @@ test('fix5: Stop against a genuine offscreen PendingStart reports status "pendin
   await startPromise;
   offscreenResponder.setStartCaptureOverride(null);
 });
+
+// ===========================================================================
+// v0.1.3: exact-page-scoped two-way LIVE saved-page slider synchronization.
+//
+//  - Saved-pages row slider drag (SET_SAVED_PAGE_LIVE_GAIN, options-only)
+//    changes any active session sharing the identical exact pageKey, live,
+//    with NO storage write and NO capture start; a confirmed change also
+//    broadcasts TAB_STATE_CHANGED so an open popup follows in real time.
+//  - Popup slider drag (SET_TAB_GAIN) additionally broadcasts
+//    SAVED_PAGE_LIVE_GAIN_CHANGED to OPTIONS so an open Saved-pages row
+//    follows in real time.
+//  - Both are exact-pageKey-scoped; a different path/query/fragment/host is
+//    never touched. A failed/stale offscreen update updates nothing.
+// ===========================================================================
+
+test('livesync#1: SET_SAVED_PAGE_LIVE_GAIN at 209% changes a matching active offscreen session to 209 (2.09)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-209.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  await enableTab(tabId);
+
+  const resp = await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: 209 }, OPTIONS_TEST_SENDER);
+  assert.equal(resp.ok, true, `expected live gain to succeed: ${JSON.stringify(resp)}`);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 209, 'the active offscreen session moved to 209 (2.09)');
+});
+
+test('livesync#2: the matching popup receives TAB_STATE_CHANGED showing 209%', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-popup-follows.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  await enableTab(tabId);
+
+  capturedBroadcasts.length = 0;
+  await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: 209 }, OPTIONS_TEST_SENDER);
+
+  const stateBroadcasts = broadcastsTo(TARGETS.POPUP, MESSAGE_TYPES.TAB_STATE_CHANGED);
+  assert.ok(stateBroadcasts.length >= 1, 'a TAB_STATE_CHANGED was broadcast to the popup');
+  const last = stateBroadcasts[stateBroadcasts.length - 1];
+  assert.equal(last.payload.tabId, tabId);
+  assert.equal(last.payload.gainPercent, 209, 'the popup broadcast carries the new 209% live gain');
+});
+
+test('livesync#3: rapid SET_SAVED_PAGE_LIVE_GAIN 150 -> 180 -> 240 leaves the session at 240%', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-rapid.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  await enableTab(tabId);
+
+  for (const value of [150, 180, 240]) {
+    await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: value }, OPTIONS_TEST_SENDER);
+  }
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 240, 'the final live value 240 wins');
+});
+
+test('livesync#4: SET_SAVED_PAGE_LIVE_GAIN writes nothing to storage (the saved default is untouched)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-no-write.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  await enableTab(tabId);
+
+  await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: 175 }, OPTIONS_TEST_SENDER);
+  const pages = await settings.getSavedPages();
+  assert.equal(pages[pageKey], 100, 'the stored default stays 100 - a live drag never persists');
+});
+
+test('livesync#5: UPDATE_SAVED_PAGE_VOLUME (the change commit) persists exactly the final value', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-commit.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  await enableTab(tabId);
+
+  // Several live drags first (persist nothing), then one commit.
+  for (const value of [150, 180, 240]) {
+    await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: value }, OPTIONS_TEST_SENDER);
+  }
+  assert.equal((await settings.getSavedPages())[pageKey], 100, 'still unpersisted while dragging');
+
+  const commit = await send(MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, { pageKey, gainPercent: 240 }, OPTIONS_TEST_SENDER);
+  assert.equal(commit.ok, true);
+  assert.equal((await settings.getSavedPages())[pageKey], 240, 'only the final committed value is persisted');
+});
+
+test('livesync#6: SET_SAVED_PAGE_LIVE_GAIN never starts capture on an inactive saved page', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-inactive.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+
+  const resp = await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: 200 }, OPTIONS_TEST_SENDER);
+  assert.equal(resp.ok, true, 'a no-op live drag with no active session still resolves ok');
+  assert.equal(offscreenResponder.sessions.has(tabId), false, 'no capture was started');
+});
+
+test('livesync#7: a different exact pageKey on the same hostname is untouched', async () => {
+  resetEverything();
+  const host = 'https://same-host.example';
+  const pageA = `${host}/a`;
+  const pageB = `${host}/b`;
+  const tabA = freshTabId();
+  const tabB = freshTabId();
+  setTab(tabA, pageA);
+  setTab(tabB, pageB);
+  await addAndAssertSaved(pageA, 100);
+  await addAndAssertSaved(pageB, 100);
+  await enableTab(tabA);
+  await enableTab(tabB);
+
+  await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey: pageA, gainPercent: 250 }, OPTIONS_TEST_SENDER);
+  assert.equal(offscreenResponder.sessions.get(tabA).gainPercent, 250, 'the exact page moved');
+  assert.equal(offscreenResponder.sessions.get(tabB).gainPercent, 100, 'the same-host different-path page is untouched');
+});
+
+test('livesync#8: popup SET_TAB_GAIN broadcasts SAVED_PAGE_LIVE_GAIN_CHANGED to the options view', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-popup-to-options.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  const { data } = await enableTab(tabId);
+
+  capturedBroadcasts.length = 0;
+  const resp = await send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId, gainPercent: 188, expectedOperationId: data.operationId });
+  assert.equal(resp.ok, true);
+
+  const optionBroadcasts = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED);
+  assert.equal(optionBroadcasts.length, 1, 'exactly one live-gain notice to the options view');
+  assert.equal(optionBroadcasts[0].payload.pageKey, pageKey);
+  assert.equal(optionBroadcasts[0].payload.gainPercent, 188);
+});
+
+test('livesync#9: popup SET_TAB_GAIN on an UNSAVED page creates no saved entry (options has no matching row)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-unsaved.example/';
+  setTab(tabId, pageKey);
+  const { data } = await enableTab(tabId); // unsaved temporary session
+
+  const resp = await send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId, gainPercent: 150, expectedOperationId: data.operationId });
+  assert.equal(resp.ok, true);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 150, 'the live gain still applied to the temporary session');
+  assert.deepEqual(await settings.getSavedPages(), {}, 'no saved entry was created for the unsaved page');
+});
+
+test('livesync#10: a FAILED offscreen live update updates neither the SW cache nor the popup', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-fail.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  await enableTab(tabId);
+
+  // The offscreen SET_TAB_GAIN fails - propagation must not falsely update.
+  offscreenResponder.setSetTabGainOverride(() => ({ ok: false, error: { code: ERROR_CODES.NOT_ACTIVE, message: 'simulated' } }));
+  capturedBroadcasts.length = 0;
+
+  await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: 250 }, OPTIONS_TEST_SENDER);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.gainPercent, 100, 'the SW cache stays at the last confirmed value, not the failed 250');
+  const popupBroadcasts = broadcastsTo(TARGETS.POPUP, MESSAGE_TYPES.TAB_STATE_CHANGED).filter((b) => b.payload.gainPercent === 250);
+  assert.equal(popupBroadcasts.length, 0, 'no popup broadcast claims the unconfirmed 250');
+
+  offscreenResponder.setSetTabGainOverride(null);
+});
+
+test('livesync#11: a stale operationId SET_TAB_GAIN is rejected and broadcasts nothing to the options view', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://livesync-stale-op.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+  const first = await enableTab(tabId);
+  const staleOperationId = first.data.operationId;
+
+  // Disable and re-enable: a brand-new operation now owns this tab.
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  const second = await enableTab(tabId);
+  assert.notEqual(second.data.operationId, staleOperationId);
+
+  capturedBroadcasts.length = 0;
+  const resp = await send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId, gainPercent: 199, expectedOperationId: staleOperationId });
+  assert.equal(resp.ok, false, 'a stale-generation gain is rejected');
+  assert.equal(resp.error.code, ERROR_CODES.NOT_ACTIVE);
+  const optionBroadcasts = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED);
+  assert.equal(optionBroadcasts.length, 0, 'a stale update moves no options row');
+});
+
+test('livesync#12: the new live-sync messages pass real target-aware validation', async () => {
+  const { validateMessage } = await import('../shared/validation.js');
+  const toSw = validateMessage({
+    target: TARGETS.SERVICE_WORKER,
+    type: MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN,
+    requestId: 'r',
+    payload: { pageKey: 'https://ok.example/', gainPercent: 150 },
+  });
+  assert.equal(toSw.ok, true, 'SET_SAVED_PAGE_LIVE_GAIN validates for the service worker');
+  const toOptions = validateMessage({
+    target: TARGETS.OPTIONS,
+    type: MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED,
+    requestId: 'r',
+    payload: { pageKey: 'https://ok.example/', gainPercent: 150 },
+  });
+  assert.equal(toOptions.ok, true, 'SAVED_PAGE_LIVE_GAIN_CHANGED validates for the options page');
+});
+
+test('livesync#13: wrong sender, wrong target, malformed pageKey, and gain above 300 are all rejected', async () => {
+  const { validateMessage } = await import('../shared/validation.js');
+
+  // Wrong sender: SET_SAVED_PAGE_LIVE_GAIN is options-only; the popup sender is rejected.
+  resetEverything();
+  const wrongSender = await send(
+    MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN,
+    { pageKey: 'https://x.example/', gainPercent: 150 },
+    DEFAULT_TEST_SENDER
+  );
+  assert.equal(wrongSender.ok, false, 'the popup sender may not send this options-only message');
+  assert.equal(wrongSender.error.code, ERROR_CODES.INVALID_MESSAGE);
+
+  // Wrong target: SAVED_PAGE_LIVE_GAIN_CHANGED addressed to the service worker is rejected by the sender matrix.
+  const wrongTarget = await send(
+    MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED,
+    { pageKey: 'https://x.example/', gainPercent: 150 },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(wrongTarget.ok, false, 'a broadcast-only type is not accepted as a service-worker command');
+
+  // Malformed pageKey (empty / non-string) is rejected by the payload validator.
+  const base = { target: TARGETS.SERVICE_WORKER, type: MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, requestId: 'r' };
+  assert.equal(validateMessage({ ...base, payload: { pageKey: '', gainPercent: 150 } }).ok, false, 'empty pageKey rejected');
+  assert.equal(validateMessage({ ...base, payload: { pageKey: 123, gainPercent: 150 } }).ok, false, 'non-string pageKey rejected');
+
+  // Gain above 300 (and non-integer) is rejected outright, not clamped.
+  assert.equal(validateMessage({ ...base, payload: { pageKey: 'https://x.example/', gainPercent: 350 } }).ok, false, 'gain > 300 rejected');
+  assert.equal(validateMessage({ ...base, payload: { pageKey: 'https://x.example/', gainPercent: 150.5 } }).ok, false, 'non-integer gain rejected');
+});

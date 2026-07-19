@@ -24,6 +24,15 @@ export const MESSAGE_TYPES = Object.freeze({
   // best-effort propagates it to any currently active session(s) sharing
   // that exact pageKey.
   UPDATE_SAVED_PAGE_VOLUME: 'UPDATE_SAVED_PAGE_VOLUME',
+  // Options/saved-pages-view -> service worker: a THROTTLED, LIVE-ONLY gain
+  // for one exact saved pageKey, sent continuously while a row slider is
+  // dragged (the `input` event). It NEVER writes storage and NEVER starts a
+  // capture session - it only applies to any currently active session(s)
+  // sharing that identical pageKey, via the same confirmed, operation-scoped
+  // offscreen update that UPDATE_SAVED_PAGE_VOLUME uses. The final value is
+  // committed exactly once, separately, through UPDATE_SAVED_PAGE_VOLUME on
+  // the slider's `change` event.
+  SET_SAVED_PAGE_LIVE_GAIN: 'SET_SAVED_PAGE_LIVE_GAIN',
   START_CAPTURE: 'START_CAPTURE',
   STOP_CAPTURE: 'STOP_CAPTURE',
   SET_TAB_GAIN: 'SET_TAB_GAIN',
@@ -42,6 +51,13 @@ export const MESSAGE_TYPES = Object.freeze({
   // starts capture. Distinct from SAVED_PAGES_CHANGED (options-only, carries
   // the whole map) so the popup never subscribes to a broad map broadcast.
   SAVED_PAGE_CHANGED: 'SAVED_PAGE_CHANGED',
+  // service worker -> options/saved-pages-view: a narrowly-scoped LIVE-gain
+  // notice for ONE exact pageKey, emitted while the POPUP slider drives an
+  // active session's live gain (from handleSetTabGain, after the offscreen
+  // document confirms the change). An open Saved-pages view moves only the
+  // matching exact row's slider + percentage in real time; it never persists.
+  // Carries just the pageKey + gainPercent (never the whole map).
+  SAVED_PAGE_LIVE_GAIN_CHANGED: 'SAVED_PAGE_LIVE_GAIN_CHANGED',
 });
 
 export const ERROR_CODES = Object.freeze({

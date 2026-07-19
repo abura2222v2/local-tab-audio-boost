@@ -221,6 +221,27 @@ automatically for you.
 
 ## Changelog
 
+### 0.1.3
+
+- **Saved pages sliders now control matching active tabs live.** Dragging a
+  saved-page row slider immediately changes the real audio gain of any tab
+  currently boosting that identical exact URL, throttled and without writing to
+  storage; the final percentage is saved once when you release the slider.
+- **The popup and Saved pages sliders synchronize in real time.** Moving the
+  popup's main slider on a saved page moves that page's Saved-pages row (and
+  vice-versa) as you drag, exact-page-scoped so a different path, query,
+  fragment, scheme, port, or host is never touched. A failed or superseded live
+  update never falsely moves either slider. The root cause was that a saved-page
+  row drag only updated the stored number (and only on release), and neither
+  view told the other about an in-progress drag.
+- **The "Clear all" confirmation is hidden until requested.** It now stays out
+  of sight until you click **Clear all saved pages**, and hides again on
+  **Cancel**, on **Escape**, and after a successful clear (a failed clear keeps
+  it visible with the error). The root cause was the same kind of stylesheet
+  rule that affected the manual-add modal in 0.1.1: an author `display` rule
+  overrode the `hidden` attribute, so the `hidden` attribute is now made
+  authoritative with `[hidden] { display: none !important }`.
+
 ### 0.1.2
 
 - Fixed **temporary boosting on unsaved pages**. **Enable boosting** now works

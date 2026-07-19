@@ -109,6 +109,13 @@ const SERVICE_WORKER_PAYLOAD_VALIDATORS = {
   // Saved-pages-view -> service worker, direct pageKey update - never
   // tab/operationId-scoped, since it does not originate from any one tab.
   [MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME]: (p) => isPlainObject(p) && isNonEmptyString(p.pageKey) && typeof p.gainPercent === 'number',
+  // Saved-pages-view -> service worker, LIVE-only (no persistence) gain for
+  // one exact pageKey. Unlike UPDATE_SAVED_PAGE_VOLUME (which clamps an
+  // arbitrary number before persisting), a live-drag value is required to be
+  // an in-range integer gain percent here (0-300) - a malformed pageKey or an
+  // out-of-range/non-integer gain is rejected outright rather than clamped, so
+  // a stray live message can never drive audio to an unintended value.
+  [MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN]: (p) => isPlainObject(p) && isNonEmptyString(p.pageKey) && isValidGainPercent(p.gainPercent),
   // START_CAPTURE carries the popup's last server-derived `expectedPageKey`
   // (never trusted as URL authority - only compared against a freshly
   // re-derived pageKey in handleStartCapture) so a click/slider observed on
@@ -157,6 +164,11 @@ const POPUP_PAYLOAD_VALIDATORS = {
 // (best-effort broadcasts from the service worker only).
 const OPTIONS_PAYLOAD_VALIDATORS = {
   [MESSAGE_TYPES.SAVED_PAGES_CHANGED]: (p) => isPlainObject(p),
+  // SAVED_PAGE_LIVE_GAIN_CHANGED carries the exact pageKey whose live gain
+  // changed (from the popup slider) plus the confirmed in-range integer
+  // gainPercent - the options view moves only the matching exact row.
+  [MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED]: (p) =>
+    isPlainObject(p) && isNonEmptyString(p.pageKey) && isValidGainPercent(p.gainPercent),
 };
 
 // Keyed by BOTH target and type - a message's `type` alone is never enough
