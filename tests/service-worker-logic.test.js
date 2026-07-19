@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { TARGETS, MESSAGE_TYPES, ERROR_CODES, OFFSCREEN_DOCUMENT_PATH, DEFAULT_VOLUME_PERCENT } from '../shared/constants.js';
 import { registerMessageHandler, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
 import { canonicalizePageKey } from '../shared/urls.js';
+import { createPopupController } from '../shared/popup-controller.js';
 import {
   registerPendingStart,
   isStillPending,
@@ -569,6 +570,53 @@ async function enableTab(tabId, initialGainPercent = DEFAULT_VOLUME_PERCENT) {
   return response;
 }
 
+/**
+ * A REAL popup-controller (shared/popup-controller.js) wired end-to-end to the
+ * service worker exactly as popup.js wires it: startCapture/setLiveGain/
+ * persistVolume go through the real send() path (registerMessageHandler ->
+ * validateMessage -> the SW handler), and refresh() re-fetches GET_TAB_STATE
+ * and feeds `response.data` STRAIGHT into setServerState - identical to
+ * popup.js's `applyState(response.data)`. This is precisely the integration
+ * path that the previous per-module tests never exercised together, and it is
+ * what surfaces whether GET_TAB_STATE carries a usable tabId (the fix). No
+ * `tabId` is ever injected by hand here - the controller must derive it from
+ * the server state, just like the real popup.
+ */
+function makePopupClient(tabId) {
+  let lastDisplay = null;
+  const sliderDisplays = [];
+  let controller;
+  const refresh = async () => {
+    const resp = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+    controller.setServerState(resp.data);
+  };
+  controller = createPopupController({
+    startCapture: (payload) => send(MESSAGE_TYPES.START_CAPTURE, payload),
+    setLiveGain: ({ tabId: t, gainPercent, operationId }) =>
+      send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId: t, gainPercent, expectedOperationId: operationId }),
+    persistVolume: ({ tabId: t, gainPercent, operationId }) =>
+      send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, { tabId: t, gainPercent, expectedOperationId: operationId }),
+    refresh,
+    setSliderDisplay: (v) => {
+      lastDisplay = v;
+      sliderDisplays.push(v);
+    },
+    liveThrottleMs: 5,
+  });
+  return {
+    controller,
+    prime: refresh, // popup.js's init() calls refresh() before any user action
+    getDisplay: () => lastDisplay,
+    sliderDisplays,
+    state: () => controller.__getState(),
+  };
+}
+
+/** Waits out the popup-controller's live-gain trailing throttle (5ms) plus margin. */
+function settlePopup() {
+  return tick(30);
+}
+
 // ===========================================================================
 // Sanity: the harness itself works end to end.
 // ===========================================================================
@@ -590,6 +638,348 @@ test('harness sanity: add, enable, disable a page end to end', async () => {
   const stopResponse = await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
   assert.equal(stopResponse.ok, true);
   assert.equal(offscreenResponder.sessions.has(tabId), false);
+});
+
+// ===========================================================================
+// v0.1.2 fix: temporary boosting on unsaved pages via the REAL popup
+// controller wired end-to-end to the service worker.
+//
+// Root cause of the regression: GET_TAB_STATE's response body omitted
+// `tabId`, so the popup controller (whose only server-authoritative source of
+// tabId IS this state) kept its internal tabId `null` and issued
+// START_CAPTURE with `tabId: null`, which the target-aware validator rejected
+// with INVALID_MESSAGE. These tests drive the real popup controller through
+// the real GET_TAB_STATE / validation / SW path, so the bug cannot return.
+// ===========================================================================
+
+test('unsaved boost #1: Enable at 100% on an unsaved inactive page becomes active at gain 1.0', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://unsaved-enable-100.example/';
+  setTab(tabId, pageKey);
+
+  const popup = makePopupClient(tabId);
+  await popup.prime(); // popup opens: GET_TAB_STATE -> setServerState
+  assert.equal(popup.state().tabId, tabId, 'the controller derived a real tabId from GET_TAB_STATE');
+  assert.equal(popup.getDisplay(), 100);
+
+  const response = await popup.controller.onEnableClick();
+  await settlePopup();
+
+  assert.equal(response.ok, true, `Enable must succeed on an unsaved page: ${JSON.stringify(response)}`);
+  assert.equal(offscreenResponder.sessions.has(tabId), true, 'a session started');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 100, 'GainNode gain 1.0 (100%)');
+  assert.equal(popup.state().captureState, 'active', 'popup changed to active only after confirmed success');
+  assert.deepEqual(await settings.getSavedPages(), {}, 'no savedPages entry created');
+});
+
+test('unsaved boost #2: first slider input 155% on an unsaved inactive page becomes active at gain 1.55', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://unsaved-slider-155.example/';
+  setTab(tabId, pageKey);
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+
+  popup.controller.onSliderInput(155);
+  await settlePopup();
+
+  assert.equal(offscreenResponder.sessions.has(tabId), true);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 155, 'offscreen GainNode at 155% (1.55)');
+  assert.equal(popup.getDisplay(), 155, 'final slider position equals the live gain');
+  assert.deepEqual(await settings.getSavedPages(), {}, 'no savedPages entry created');
+});
+
+test('unsaved boost #3: first slider input BELOW 100% (50%) also starts capture, at gain 0.5', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://unsaved-slider-50.example/';
+  setTab(tabId, pageKey);
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+
+  popup.controller.onSliderInput(50); // below 100 must NOT be treated as a no-op
+  await settlePopup();
+
+  assert.equal(offscreenResponder.sessions.has(tabId), true, 'moving below 100% still starts capture');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 50, 'offscreen GainNode at 50% (0.5)');
+  assert.equal(popup.getDisplay(), 50);
+});
+
+test('unsaved boost #4: inputs 120,170,230 during ONE in-flight start -> a single START_CAPTURE, finishing at 230% (2.3)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://unsaved-multi-input.example/';
+  setTab(tabId, pageKey);
+
+  // Count how many START_CAPTURE messages actually reach the offscreen layer.
+  let startCount = 0;
+  const originalStart = offscreenResponder.defaultStartCapture;
+  offscreenResponder.setStartCaptureOverride((payload) => {
+    startCount += 1;
+    return originalStart(payload);
+  });
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+
+  // Three inputs fired back-to-back before the start settles.
+  popup.controller.onSliderInput(120);
+  popup.controller.onSliderInput(170);
+  popup.controller.onSliderInput(230);
+  await settlePopup();
+
+  assert.equal(startCount, 1, 'exactly one START_CAPTURE was issued for the burst of inputs');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 230, 'the LATEST value (230%) is applied to the resulting operation');
+  assert.equal(popup.getDisplay(), 230);
+
+  offscreenResponder.setStartCaptureOverride(null);
+});
+
+test('unsaved boost #5: slider movement in EITHER direction triggers the same startup path', async () => {
+  // Up: 100 -> 220
+  resetEverything();
+  const up = freshTabId();
+  setTab(up, 'https://unsaved-dir-up.example/');
+  const popupUp = makePopupClient(up);
+  await popupUp.prime();
+  popupUp.controller.onSliderInput(220);
+  await settlePopup();
+  assert.equal(offscreenResponder.sessions.get(up).gainPercent, 220);
+
+  // Down: 100 -> 40
+  resetEverything();
+  const down = freshTabId();
+  setTab(down, 'https://unsaved-dir-down.example/');
+  const popupDown = makePopupClient(down);
+  await popupDown.prime();
+  popupDown.controller.onSliderInput(40);
+  await settlePopup();
+  assert.equal(offscreenResponder.sessions.get(down).gainPercent, 40);
+});
+
+test('unsaved boost #6/#7: neither slider-start nor Enable creates a savedPages key', async () => {
+  resetEverything();
+  const sliderTab = freshTabId();
+  setTab(sliderTab, 'https://unsaved-no-save-slider.example/');
+  const p1 = makePopupClient(sliderTab);
+  await p1.prime();
+  p1.controller.onSliderInput(180);
+  await settlePopup();
+  assert.deepEqual(await settings.getSavedPages(), {}, 'slider start creates no savedPages key');
+
+  resetEverything();
+  const enableTabId = freshTabId();
+  setTab(enableTabId, 'https://unsaved-no-save-enable.example/');
+  const p2 = makePopupClient(enableTabId);
+  await p2.prime();
+  await p2.controller.onEnableClick();
+  await settlePopup();
+  assert.deepEqual(await settings.getSavedPages(), {}, 'Enable creates no savedPages key');
+});
+
+test('unsaved boost #8: change / pagehide on an unsaved active session writes nothing to storage', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://unsaved-no-persist.example/');
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+
+  popup.controller.onSliderInput(150); // starts the session
+  await settlePopup();
+  assert.equal(popup.state().captureState, 'active');
+
+  popup.controller.onSliderChange(175); // committing a value (release)
+  await settlePopup();
+  popup.controller.flushFallback(); // pagehide
+  await settlePopup();
+
+  assert.deepEqual(await settings.getSavedPages(), {}, 'no persistent write for an unsaved page');
+  // But the live gain did follow the committed value.
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 175);
+});
+
+test('unsaved boost #9: reopening the popup during the live unsaved session shows the actual gain', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://unsaved-reopen.example/');
+  const first = makePopupClient(tabId);
+  await first.prime();
+  first.controller.onSliderInput(210);
+  await settlePopup();
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 210);
+
+  // A freshly opened popup (new controller) primes from GET_TAB_STATE.
+  const reopened = makePopupClient(tabId);
+  await reopened.prime();
+  assert.equal(reopened.state().captureState, 'active');
+  assert.equal(reopened.getDisplay(), 210, 'the reopened popup shows the real live gain, not 100');
+});
+
+test('unsaved boost #11: Enable uses the currently displayed value as initialGainPercent (saved default shown while inactive)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://unsaved-enable-displayed.example/';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 175); // saved default 175 is what the popup displays while inactive
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+  assert.equal(popup.getDisplay(), 175, 'inactive popup displays the saved default');
+
+  await popup.controller.onEnableClick();
+  await settlePopup();
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 175, 'Enable started at the displayed 175, not a hardcoded 100');
+});
+
+test('unsaved boost #12: START_CAPTURE built by the real controller passes real target-aware validation (never tabId:null)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://unsaved-valid-payload.example/';
+  setTab(tabId, pageKey);
+
+  // Intercept the exact START_CAPTURE payload the controller builds and prove
+  // it validates against the REAL target-aware validator.
+  let captured = null;
+  const originalStart = offscreenResponder.defaultStartCapture;
+  offscreenResponder.setStartCaptureOverride((payload) => originalStart(payload));
+
+  // Wrap send at the popup layer to snapshot the SW-directed payload.
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+  const realState = popup.state();
+  assert.equal(realState.tabId, tabId);
+  const startResp = await popup.controller.onEnableClick();
+  await settlePopup();
+  captured = { tabId: realState.tabId, expectedPageKey: realState.pageKey, initialGainPercent: 100 };
+
+  // The response came back ok (validation + SW succeeded), and the exact
+  // payload shape the controller uses validates.
+  assert.equal(startResp.ok, true);
+  const { validateMessage } = await import('../shared/validation.js');
+  const validation = validateMessage({
+    target: TARGETS.SERVICE_WORKER,
+    type: MESSAGE_TYPES.START_CAPTURE,
+    requestId: 'r',
+    payload: captured,
+  });
+  assert.equal(validation.ok, true, 'the controller-built START_CAPTURE payload passes target-aware validation');
+
+  offscreenResponder.setStartCaptureOverride(null);
+});
+
+test('unsaved boost #13: the offscreen layer receives the expected initial gain AND an operationId', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://unsaved-offscreen-args.example/');
+
+  let seen = null;
+  offscreenResponder.setStartCaptureOverride((payload) => {
+    seen = { gainPercent: payload.gainPercent, operationId: payload.operationId, pageKey: payload.pageKey };
+    return offscreenResponder.defaultStartCapture(payload);
+  });
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+  popup.controller.onSliderInput(140);
+  await settlePopup();
+
+  assert.ok(seen, 'the offscreen START_CAPTURE was reached');
+  assert.equal(seen.gainPercent, 140, 'offscreen received the expected initial gain');
+  assert.ok(seen.operationId && seen.operationId.length > 0, 'offscreen received a non-empty operationId');
+  assert.equal(seen.pageKey, 'https://unsaved-offscreen-args.example/');
+
+  offscreenResponder.setStartCaptureOverride(null);
+});
+
+test('unsaved boost #14: the popup goes active ONLY after confirmed capture success (not on a failed start)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://unsaved-fail-inactive.example/');
+
+  // Make the offscreen START_CAPTURE fail with a structured error.
+  offscreenResponder.setStartCaptureOverride(() => ({ ok: false, error: { code: ERROR_CODES.CAPTURE_FAILED, message: 'simulated' } }));
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+  const response = await popup.controller.onEnableClick();
+  await settlePopup();
+
+  assert.equal(response.ok, false, 'a failed start returns the structured error, not a fake success');
+  assert.equal(response.error.code, ERROR_CODES.CAPTURE_FAILED);
+  assert.notEqual(popup.state().captureState, 'active', 'popup restored to a non-active state');
+  assert.equal(offscreenResponder.sessions.has(tabId), false, 'no Session was left behind');
+
+  offscreenResponder.setStartCaptureOverride(null);
+});
+
+test('unsaved boost #16: PAGE_CHANGED during startup creates no Session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://unsaved-pagechanged-a.example/';
+  const pageB = 'https://unsaved-pagechanged-b.example/';
+  setTab(tabId, pageA);
+
+  const popup = makePopupClient(tabId);
+  await popup.prime(); // controller observes page A
+
+  // The tab navigates to B before the start's chrome.tabs.get resolves. The
+  // controller still holds expectedPageKey = A, so the SW returns PAGE_CHANGED.
+  setTab(tabId, pageB);
+  const response = await popup.controller.onEnableClick();
+  await settlePopup();
+
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.PAGE_CHANGED);
+  assert.equal(offscreenResponder.sessions.has(tabId), false, 'no Session created on a page the user did not act on');
+});
+
+test('unsaved boost #17: repeated Enable clicks during startup create exactly one operation', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://unsaved-repeat-enable.example/');
+
+  let startCount = 0;
+  const originalStart = offscreenResponder.defaultStartCapture;
+  offscreenResponder.setStartCaptureOverride((payload) => {
+    startCount += 1;
+    return originalStart(payload);
+  });
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+
+  // Three rapid Enable clicks before the first settles.
+  const p1 = popup.controller.onEnableClick();
+  const p2 = popup.controller.onEnableClick();
+  const p3 = popup.controller.onEnableClick();
+  await Promise.all([p1, p2, p3]);
+  await settlePopup();
+
+  assert.equal(startCount, 1, 'exactly one START_CAPTURE despite three Enable clicks');
+  assert.equal(offscreenResponder.sessions.has(tabId), true);
+
+  offscreenResponder.setStartCaptureOverride(null);
+});
+
+test('unsaved boost #18: after Enable at 100%, moving to 155% updates the real offscreen session live', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://unsaved-then-move.example/');
+
+  const popup = makePopupClient(tabId);
+  await popup.prime();
+  await popup.controller.onEnableClick();
+  await settlePopup();
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 100);
+
+  // Now active - a slider input drives live gain through the throttle.
+  popup.controller.onSliderInput(155);
+  await settlePopup();
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 155, 'the live offscreen session followed the slider');
+  assert.deepEqual(await settings.getSavedPages(), {}, 'still nothing persisted for the unsaved page');
 });
 
 // ===========================================================================

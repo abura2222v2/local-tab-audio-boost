@@ -621,8 +621,14 @@ async function resolvePageKeyForTab(tabId) {
 async function computeTabStateData(tabId) {
   const entry = sessions.get(tabId);
 
+  // `tabId` is always included so the GET_TAB_STATE response is
+  // self-describing: the popup's controller derives its own working tabId
+  // from this state (it has no other server-authoritative source), and every
+  // START_CAPTURE / SET_TAB_GAIN it then issues carries a valid tabId. This
+  // matches the tabId already carried by TAB_STATE_CHANGED broadcasts.
   if (entry && entry.state === 'resolving') {
     return {
+      tabId,
       pageKey: null,
       displayUrl: null,
       saved: false,
@@ -636,6 +642,7 @@ async function computeTabStateData(tabId) {
   const resolved = await resolvePageKeyForTab(tabId);
   if (!resolved.ok) {
     return {
+      tabId,
       pageKey: null,
       displayUrl: null,
       saved: false,
@@ -654,6 +661,7 @@ async function computeTabStateData(tabId) {
   const gainPercent =
     state === 'active' && entry ? entry.gainPercent : (savedPages[resolved.pageKey] ?? DEFAULT_VOLUME_PERCENT);
   return {
+    tabId,
     pageKey: resolved.pageKey,
     displayUrl: resolved.pageKey,
     saved,

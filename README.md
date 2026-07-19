@@ -221,6 +221,17 @@ automatically for you.
 
 ## Changelog
 
+### 0.1.2
+
+- Fixed **temporary boosting on unsaved pages**. **Enable boosting** now works
+  on any supported page without saving it first and without touching the
+  slider (it starts at the currently displayed value, normally 100%). The
+  **first slider interaction** on an inactive page now correctly starts a
+  temporary session and applies the exact value you selected - in either
+  direction (e.g. 100% → 155% or 100% → 50%). The root cause was that the
+  popup's tab-state response omitted the tab id, so the popup issued a capture
+  request with a missing tab id that failed message validation.
+
 ### 0.1.1
 
 - Fixed the **Add URL manually** modal: it no longer opens automatically when
