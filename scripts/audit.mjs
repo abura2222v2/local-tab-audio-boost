@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-const RUNTIME_ROOTS = ['manifest.json', 'service-worker.js', 'offscreen', 'popup', 'options', 'shared'];
+const RUNTIME_ROOTS = ['manifest.json', 'service-worker.js', 'offscreen', 'popup', 'options', 'shared', 'page-audio'];
 const RUNTIME_EXTENSIONS = new Set(['.js', '.html', '.css', '.json']);
 
 function walk(relPath) {
@@ -46,7 +46,9 @@ function warn(check, detail) {
 
 // 1. Manifest permissions ---------------------------------------------------
 const manifest = JSON.parse(runtimeContents.get('manifest.json') ?? '{}');
-const expectedPermissions = ['activeTab', 'tabCapture', 'offscreen', 'storage', 'webNavigation'];
+// `scripting` is required by the fullscreen-compatible page-audio backend,
+// which injects its packaged controller only after an explicit user action.
+const expectedPermissions = ['activeTab', 'tabCapture', 'offscreen', 'storage', 'webNavigation', 'scripting'];
 const actualPermissions = Array.isArray(manifest.permissions) ? manifest.permissions : [];
 const permissionsMatch =
   actualPermissions.length === expectedPermissions.length &&
@@ -322,7 +324,99 @@ for (const type of SW_HANDLED_MESSAGE_TYPES) {
   }
 }
 
-// 19. Public-repository hygiene ---------------------------------------------------
+// 19. Fullscreen integrity + page-audio injection safety ---------------------------
+// The whole point of the page-audio backend is that the page's OWN fullscreen
+// keeps working. That requires the extension to stay entirely out of the
+// fullscreen path, and to never hold a tab-capture stream while it is active.
+{
+  const stripComments = (source) =>
+    source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((line) => {
+        const index = line.indexOf('//');
+        return index === -1 ? line : line.slice(0, index);
+      })
+      .join('\n');
+
+  // No fullscreen interception, patching, or synthetic key injection anywhere.
+  const FULLSCREEN_FORBIDDEN = [
+    'requestFullscreen',
+    'webkitRequestFullscreen',
+    'mozRequestFullScreen',
+    'exitFullscreen',
+    'new KeyboardEvent',
+    'initKeyboardEvent',
+    'keyCode: 122',
+    "key: 'F11'",
+    'key:"F11"',
+  ];
+  for (const [file, content] of runtimeJsEntries) {
+    const code = stripComments(content);
+    for (const token of FULLSCREEN_FORBIDDEN) {
+      if (code.includes(token)) {
+        fail('fullscreen-interference', `${file} references "${token}" - the extension must stay out of the fullscreen path`);
+      }
+    }
+  }
+
+  // The MAIN-world page controller must hold no extension privilege at all,
+  // and must never reach for capture.
+  const controllerFile = 'page-audio/page-audio-controller.js';
+  const controllerCode = stripComments(runtimeContents.get(controllerFile) ?? '');
+  if (!controllerCode) {
+    fail('missing-page-controller', `${controllerFile} is required by the page-audio backend`);
+  }
+  for (const token of ['chrome.tabCapture', 'chrome.storage', 'chrome.offscreen', 'chrome.scripting', 'getUserMedia', 'MediaRecorder']) {
+    if (controllerCode.includes(token)) {
+      fail('page-controller-privilege', `${controllerFile} must not reference ${token}`);
+    }
+  }
+  // It must not touch the player's controls, layout, or element volume.
+  for (const token of ['preventDefault', 'stopPropagation', 'innerHTML', 'appendChild', 'replaceChild']) {
+    if (controllerCode.includes(token)) {
+      fail('page-controller-dom-interference', `${controllerFile} must not use ${token}`);
+    }
+  }
+  if (/\.volume\s*=/.test(controllerCode) || /\.muted\s*=/.test(controllerCode)) {
+    fail('page-controller-dom-interference', `${controllerFile} must not change element volume/muted`);
+  }
+
+  // Injection must use packaged local files - never a code string or a
+  // serialized function.
+  const swCode = stripComments(runtimeContents.get('service-worker.js') ?? '');
+  if (swCode.includes('executeScript')) {
+    if (!/files:\s*\[/.test(swCode)) {
+      fail('injection-not-packaged', 'chrome.scripting.executeScript must inject packaged files');
+    }
+    if (/executeScript\([^)]*\bcode\s*:/.test(swCode) || /executeScript\([^)]*\bfunc\s*:/.test(swCode)) {
+      fail('injection-not-packaged', 'chrome.scripting.executeScript must not inject a code string or serialized function');
+    }
+  }
+
+  // The page-audio start path must never call tabCapture. Checked structurally:
+  // the page-audio activation helpers and the tabCapture call sites must not
+  // appear in the same function body.
+  const pageAudioStart = (swCode.match(/async function activatePageAudio[\s\S]*?\n\}/) || [''])[0];
+  if (pageAudioStart && /chrome\.tabCapture/.test(pageAudioStart)) {
+    fail('page-audio-uses-capture', 'the page-audio activation path must never call chrome.tabCapture');
+  }
+  const pageAudioHandler = (swCode.match(/async function handleStartPageAudio[\s\S]*?\n\}/) || [''])[0];
+  if (pageAudioHandler && /chrome\.tabCapture|ensureOffscreenDocument/.test(pageAudioHandler)) {
+    fail('page-audio-uses-capture', 'handleStartPageAudio must never call tabCapture or create an offscreen document');
+  }
+
+  // Compatibility mode must remain a distinct, explicitly-requested message.
+  const constantsCode = runtimeContents.get('shared/constants.js') ?? '';
+  if (!constantsCode.includes('START_PAGE_AUDIO')) {
+    fail('missing-page-audio-message', 'START_PAGE_AUDIO must exist as its own message type');
+  }
+  if (!constantsCode.includes('START_CAPTURE')) {
+    fail('missing-compat-message', 'START_CAPTURE must remain as the explicit compatibility backend');
+  }
+}
+
+// 20. Public-repository hygiene ---------------------------------------------------
 // The published tree should contain the extension, its tests, and its
 // documentation - not the working files of whatever tooling produced it, and
 // not machine-specific paths. Only TRACKED files are considered: local scratch
@@ -415,7 +509,7 @@ if (trackedFiles === null) {
 }
 
 // ---------------------------------------------------------------------------------
-console.log(`Scanned ${runtimeFiles.length} runtime files (manifest.json, service-worker.js, offscreen/, popup/, options/, shared/).`);
+console.log(`Scanned ${runtimeFiles.length} runtime files (manifest.json, service-worker.js, offscreen/, popup/, options/, shared/, page-audio/).`);
 console.log('tests/, README.md, SECURITY.md, and LICENSE are intentionally excluded from pattern scanning.\n');
 
 if (advisories.length > 0) {

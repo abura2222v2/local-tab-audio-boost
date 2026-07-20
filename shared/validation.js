@@ -147,6 +147,11 @@ const SERVICE_WORKER_PAYLOAD_VALIDATORS = {
   // click), bound to the resulting operation as its starting gain.
   [MESSAGE_TYPES.START_CAPTURE]: (p) =>
     isPlainObject(p) && isValidTabId(p.tabId) && isNonEmptyString(p.expectedPageKey) && typeof p.initialGainPercent === 'number',
+  // START_PAGE_AUDIO carries exactly the same tab/page/gain contract as
+  // START_CAPTURE - the difference is which backend the service worker then
+  // uses, never anything the popup is trusted to decide on its own.
+  [MESSAGE_TYPES.START_PAGE_AUDIO]: (p) =>
+    isPlainObject(p) && isValidTabId(p.tabId) && isNonEmptyString(p.expectedPageKey) && typeof p.initialGainPercent === 'number',
   [MESSAGE_TYPES.STOP_CAPTURE]: (p) => isPlainObject(p) && isValidTabId(p.tabId),
   // SET_TAB_GAIN/PERSIST_PAGE_VOLUME carry the popup's expectedOperationId
   // (from the same tab's last GET_TAB_STATE/TAB_STATE_CHANGED) so a

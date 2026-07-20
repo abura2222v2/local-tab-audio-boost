@@ -45,6 +45,14 @@ export const MESSAGE_TYPES = Object.freeze({
   // unrelated page, and a failed page is never reported as succeeded.
   RESET_SELECTED_SAVED_PAGES_TO_100: 'RESET_SELECTED_SAVED_PAGES_TO_100',
   DELETE_SELECTED_SAVED_PAGES: 'DELETE_SELECTED_SAVED_PAGES',
+  // Popup -> service worker: starts the fullscreen-compatible page-audio
+  // backend for the current tab. This is what an ordinary Enable click (or a
+  // first slider move) requests; it never touches chrome.tabCapture, so the
+  // page's own fullscreen keeps working and no capture indicator appears.
+  START_PAGE_AUDIO: 'START_PAGE_AUDIO',
+  // Popup -> service worker: the DELIBERATE fallback to the tabCapture
+  // backend, offered only after page-audio reported a structured reason it
+  // cannot work. Never chosen automatically.
   START_CAPTURE: 'START_CAPTURE',
   STOP_CAPTURE: 'STOP_CAPTURE',
   SET_TAB_GAIN: 'SET_TAB_GAIN',
@@ -85,6 +93,11 @@ export const ERROR_CODES = Object.freeze({
   // from the saved-pages view) targets a pageKey that isn't saved.
   PAGE_NOT_SAVED: 'PAGE_NOT_SAVED',
   CAPTURE_FAILED: 'CAPTURE_FAILED',
+  // The fullscreen-compatible page-audio backend cannot run on this page (its
+  // media is cross-origin without CORS, DRM-protected, or in a frame the
+  // extension cannot reach). Never triggers an automatic fallback - the popup
+  // shows the reason and offers compatibility mode as a separate choice.
+  PAGE_AUDIO_UNSUPPORTED: 'PAGE_AUDIO_UNSUPPORTED',
   ALREADY_IN_PROGRESS: 'ALREADY_IN_PROGRESS',
   RECONCILIATION_FAILED: 'RECONCILIATION_FAILED',
   NOT_ACTIVE: 'NOT_ACTIVE',
@@ -130,6 +143,16 @@ export const MAX_GAIN_PERCENT = 300;
 // fail-closed cleanup and while confirming an operation-scoped teardown
 // after a failed/ambiguous capture start.
 export const OFFSCREEN_RESPONSE_TIMEOUT_MS = 1500;
+
+// How long the service worker waits for an injected page-audio frame bridge
+// to answer before treating that frame as unreachable. A page that never
+// replies must never leave an Enable click hanging.
+export const PAGE_AUDIO_RESPONSE_TIMEOUT_MS = 2000;
+
+// How long the offscreen document may sit with no active or pending
+// compatibility work before it is closed. Debounced, and always re-checked
+// against authoritative state immediately before the close actually runs.
+export const OFFSCREEN_IDLE_CLOSE_MS = 10000;
 
 export const STORAGE_KEYS = Object.freeze({
   SETTINGS: 'settings',

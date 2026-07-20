@@ -209,6 +209,30 @@ let createDocumentCallCount = 0;
 let getMediaStreamIdImpl = async ({ targetTabId }) => `stream-for-${targetTabId}`;
 let tabsGetGates = new Map(); // tabId -> Promise, paused chrome.tabs.get calls
 
+// --- page-audio backend fakes -------------------------------------------
+// tabCaptureCalls counts EVERY chrome.tabCapture entry point, so a test can
+// prove the fullscreen-compatible path never touches capture at all.
+let tabCaptureCalls = 0;
+let executeScriptCalls = []; // {tabId, frameIds, world, files}
+let injectableFrames = new Map(); // tabId -> [{frameId, documentId}]
+let inaccessibleFrames = new Set(); // `${tabId}:${frameId}` that executeScript rejects
+// One fake page controller per injected frame, mirroring the real MAIN-world
+// controller's contract closely enough to drive the service worker.
+let pageControllers = new Map(); // `${tabId}:${frameId}` -> {installed, gainPercent, state, operationToken}
+let pageMediaState = new Map(); // tabId -> state the controller reports on INSTALL
+
+function frameKey(tabId, frameId) {
+  return `${tabId}:${frameId}`;
+}
+
+function setInjectableFrames(tabId, frames) {
+  injectableFrames.set(tabId, frames);
+}
+
+function setPageMediaState(tabId, state) {
+  pageMediaState.set(tabId, state);
+}
+
 const offscreenResponder = createOffscreenResponder();
 
 async function dispatch(message, senderOverride) {
@@ -295,6 +319,41 @@ globalThis.chrome = {
     },
   },
   tabs: {
+    /**
+     * Drives the fake page-audio bridge/controller for one frame. Mirrors the
+     * real contract: an uninstalled frame never answers, a stale operation
+     * token is rejected, and RESET_TO_NEUTRAL returns gain to exactly 100.
+     */
+    async sendMessage(tabId, message, options) {
+      const frameId = options?.frameId ?? 0;
+      const controller = pageControllers.get(frameKey(tabId, frameId));
+      if (!controller) throw new Error('Could not establish connection');
+      const command = message?.command;
+      if (!command) return { ok: false, reason: 'INVALID_COMMAND' };
+
+      if (command.type === 'INSTALL') {
+        controller.operationToken = command.operationToken;
+        controller.gainPercent = command.gainPercent;
+        controller.state = pageMediaState.get(tabId) ?? 'ACTIVE_WITH_MEDIA';
+        return { ok: true, data: { state: controller.state, gainPercent: command.gainPercent, refusals: controller.state === 'UNSUPPORTED_MEDIA' ? ['CROSS_ORIGIN_NO_CORS'] : [] } };
+      }
+      if (controller.operationToken !== command.operationToken) {
+        return { ok: false, rejected: true, reason: 'STALE_OPERATION' };
+      }
+      if (command.type === 'SET_GAIN') {
+        controller.gainPercent = command.gainPercent;
+        return { ok: true, data: { state: controller.state, gainPercent: command.gainPercent } };
+      }
+      if (command.type === 'RESET_TO_NEUTRAL') {
+        controller.gainPercent = 100;
+        return { ok: true, data: { state: controller.state, gainPercent: 100 } };
+      }
+      if (command.type === 'DISPOSE_OBSERVERS') {
+        controller.observersDisposed = true;
+        return { ok: true, data: { state: controller.state, gainPercent: controller.gainPercent } };
+      }
+      return { ok: true, data: { state: controller.state, gainPercent: controller.gainPercent } };
+    },
     async get(tabId) {
       if (tabsGetGates.has(tabId)) {
         await tabsGetGates.get(tabId);
@@ -316,9 +375,11 @@ globalThis.chrome = {
   },
   tabCapture: {
     async getMediaStreamId(opts) {
+      tabCaptureCalls += 1;
       return getMediaStreamIdImpl(opts);
     },
     async getCapturedTabs() {
+      tabCaptureCalls += 1;
       return capturedTabsData;
     },
     onStatusChanged: {
@@ -347,6 +408,36 @@ globalThis.chrome = {
       const tab = tabsData.get(tabId);
       if (!tab) return undefined;
       return { url: tab.url };
+    },
+    async getAllFrames({ tabId }) {
+      if (injectableFrames.has(tabId)) {
+        return injectableFrames.get(tabId).map((f) => ({ ...f, url: tabsData.get(tabId)?.url ?? 'https://frame.example/' }));
+      }
+      const tab = tabsData.get(tabId);
+      return tab ? [{ frameId: 0, documentId: `doc-${tabId}`, url: tab.url }] : [];
+    },
+  },
+  scripting: {
+    async executeScript({ target, world, files }) {
+      const frameIds = target.frameIds ?? [0];
+      for (const frameId of frameIds) {
+        if (inaccessibleFrames.has(frameKey(target.tabId, frameId))) {
+          throw new Error('Cannot access contents of the page');
+        }
+      }
+      executeScriptCalls.push({ tabId: target.tabId, frameIds, world: world ?? 'ISOLATED', files });
+      // The MAIN-world file installs the page controller; installation is
+      // idempotent exactly like the real one.
+      if (world === 'MAIN') {
+        for (const frameId of frameIds) {
+          const key = frameKey(target.tabId, frameId);
+          if (!pageControllers.has(key)) {
+            pageControllers.set(key, { installed: 0, gainPercent: 100, state: null, operationToken: null });
+          }
+          pageControllers.get(key).installed += 1;
+        }
+      }
+      return frameIds.map((frameId) => ({ frameId, result: null }));
     },
   },
   offscreen: {
@@ -580,6 +671,26 @@ function resetEverything() {
   globalThis.chrome.tabCapture.getCapturedTabs = CANONICAL_GET_CAPTURED_TABS;
   globalThis.chrome.offscreen.closeDocument = CANONICAL_CLOSE_DOCUMENT;
   capturedBroadcasts.length = 0;
+  tabCaptureCalls = 0;
+  executeScriptCalls = [];
+  injectableFrames = new Map();
+  inaccessibleFrames = new Set();
+  pageControllers = new Map();
+  pageMediaState = new Map();
+}
+
+/**
+ * Enables the fullscreen-compatible page-audio backend end to end and asserts
+ * it became active. Returns the response so callers can use its operationId.
+ */
+async function enablePageAudio(tabId, initialGainPercent = DEFAULT_VOLUME_PERCENT) {
+  const response = await send(MESSAGE_TYPES.START_PAGE_AUDIO, startPayload(tabId, initialGainPercent));
+  assert.equal(response.ok, true, `expected page-audio to start: ${JSON.stringify(response)}`);
+  return response;
+}
+
+function pageGainFor(tabId, frameId = 0) {
+  return pageControllers.get(frameKey(tabId, frameId))?.gainPercent ?? null;
 }
 
 function broadcastsTo(target, type) {
@@ -5381,4 +5492,364 @@ test('GET_SAVED_PAGES returns schema-6 records plus the currently active exact p
   });
   assert.deepEqual(response.data.activePageKeys, [activeKey], 'only the genuinely active exact page is listed');
   assert.equal(response.data.savedPages[idleKey].volumePercent, 120);
+});
+
+// ===========================================================================
+// v0.3.0 Stage 1: the fullscreen-compatible page-audio backend, driven end to
+// end through the real registerMessageHandler -> validateMessage -> service
+// worker path.
+//
+// The defining guarantee of this backend is negative: an ordinary Enable must
+// never touch chrome.tabCapture and never create an offscreen document, because
+// a live capture session is exactly what stops the page's own fullscreen from
+// working and lights the capture indicator.
+// ===========================================================================
+
+test('page-audio #1/#2/#3: an ordinary Enable uses page-audio, never tabCapture, never offscreen', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch', 'A Film');
+
+  const response = await enablePageAudio(tabId, 200);
+
+  assert.equal(response.data.backend, 'page-audio', 'the page-audio backend owns the session');
+  assert.equal(response.data.state, 'active');
+  assert.equal(tabCaptureCalls, 0, 'chrome.tabCapture was never called');
+  assert.equal(createDocumentCallCount, 0, 'no offscreen document was created');
+  assert.equal(offscreenDocumentCreated, false);
+  assert.equal(offscreenResponder.sessions.size, 0, 'no offscreen session exists');
+  assert.equal(pageGainFor(tabId), 200, 'the page controller received the requested gain');
+});
+
+test('page-audio #4/#5: injection happens only after the explicit action, targeting the current tab', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch', 'A Film');
+
+  // Merely reading state must never inject anything.
+  await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(executeScriptCalls.length, 0, 'no injection before an explicit user action');
+
+  await enablePageAudio(tabId, 150);
+  assert.ok(executeScriptCalls.length >= 2, 'the explicit action injected the bridge and the controller');
+  for (const call of executeScriptCalls) {
+    assert.equal(call.tabId, tabId, 'injection targets the tab the user acted on');
+  }
+});
+
+test('page-audio: only packaged local files are injected - never a generated code string', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch');
+  await enablePageAudio(tabId);
+
+  for (const call of executeScriptCalls) {
+    assert.ok(Array.isArray(call.files) && call.files.length > 0, 'every injection uses `files`');
+    for (const file of call.files) {
+      assert.match(file, /^page-audio\/[a-z-]+\.js$/, `${file} is a packaged local file`);
+    }
+    assert.equal('func' in call, false, 'no serialized function injection');
+    assert.equal('code' in call, false, 'no code-string injection');
+  }
+  const worlds = executeScriptCalls.map((c) => c.world);
+  assert.ok(worlds.includes('ISOLATED'), 'the extension bridge is injected into the isolated world');
+  assert.ok(worlds.includes('MAIN'), 'the page controller is injected into the MAIN world');
+});
+
+test('page-audio #6/#7: repeated Enable does not build a second controller', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch');
+
+  await enablePageAudio(tabId, 120);
+  const installsAfterFirst = pageControllers.get(`${tabId}:0`).installed;
+
+  // A second Enable while already active is a no-op for the session.
+  const second = await send(MESSAGE_TYPES.START_PAGE_AUDIO, startPayload(tabId, 180));
+  assert.equal(second.ok, true);
+  assert.equal(
+    pageControllers.get(`${tabId}:0`).installed,
+    installsAfterFirst,
+    'no second controller installation for an already-active tab'
+  );
+});
+
+test('page-audio #26: gain updates reach the page controller and are operation-scoped', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch');
+  const { data } = await enablePageAudio(tabId, 100);
+
+  const response = await send(MESSAGE_TYPES.SET_TAB_GAIN, {
+    tabId,
+    gainPercent: 235,
+    expectedOperationId: data.operationId,
+  });
+  assert.equal(response.ok, true);
+  assert.equal(pageGainFor(tabId), 235, 'the page controller applied the new gain');
+  assert.equal(tabCaptureCalls, 0, 'still no capture involvement');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.gainPercent, 235);
+  assert.equal(state.data.backend, 'page-audio');
+});
+
+test('page-audio #27: a stale operationId gain update is rejected and changes nothing', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch');
+  const first = await enablePageAudio(tabId, 150);
+  const staleOperationId = first.data.operationId;
+
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  const second = await enablePageAudio(tabId, 150);
+  assert.notEqual(second.data.operationId, staleOperationId);
+
+  const response = await send(MESSAGE_TYPES.SET_TAB_GAIN, {
+    tabId,
+    gainPercent: 300,
+    expectedOperationId: staleOperationId,
+  });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.NOT_ACTIVE);
+  assert.notEqual(pageGainFor(tabId), 300, 'the superseded generation could not move live audio');
+});
+
+test('page-audio #24: an unsupported player reports a structured reason and never starts capture', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://drm.example/watch');
+  setPageMediaState(tabId, 'UNSUPPORTED_MEDIA');
+
+  const response = await send(MESSAGE_TYPES.START_PAGE_AUDIO, startPayload(tabId, 200));
+
+  assert.equal(response.ok, false, 'never a fake success for a player that cannot be routed');
+  assert.equal(response.error.code, ERROR_CODES.PAGE_AUDIO_UNSUPPORTED);
+  assert.ok(response.error.message.length > 10, 'a real reason is reported');
+  assert.equal(tabCaptureCalls, 0, 'compatibility mode was NOT started silently');
+  assert.equal(createDocumentCallCount, 0, 'no offscreen document was created');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.notEqual(state.data.state, 'active', 'the tab is left cleanly inactive');
+});
+
+test('page-audio #22: an inaccessible cross-origin frame reports a structured permission result', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://host.example/watch');
+  // The player lives in a subframe this extension cannot script.
+  setInjectableFrames(tabId, [{ frameId: 1, documentId: 'doc-iframe' }]);
+  inaccessibleFrames.add(`${tabId}:1`);
+
+  const response = await send(MESSAGE_TYPES.START_PAGE_AUDIO, startPayload(tabId, 200));
+
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.PAGE_AUDIO_UNSUPPORTED);
+  assert.equal(response.error.pageAudioState, 'PERMISSION_REQUIRED', 'reported as a permission problem');
+  assert.equal(tabCaptureCalls, 0, 'a frame-access failure never escalates to capture');
+});
+
+test('page-audio #23/#25: compatibility mode starts ONLY from its own explicit message', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://drm.example/watch');
+  setPageMediaState(tabId, 'UNSUPPORTED_MEDIA');
+
+  // The ordinary path declines and leaves everything untouched.
+  const declined = await send(MESSAGE_TYPES.START_PAGE_AUDIO, startPayload(tabId, 180));
+  assert.equal(declined.ok, false);
+  assert.equal(tabCaptureCalls, 0);
+
+  // The user then deliberately chooses compatibility mode.
+  const compat = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 180));
+  assert.equal(compat.ok, true, 'the explicit fallback starts the existing backend');
+  assert.equal(compat.data.state, 'active');
+  assert.ok(tabCaptureCalls > 0, 'now, and only now, tabCapture is used');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 180);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.backend, 'tab-capture', 'the session reports the compatibility backend');
+});
+
+test('page-audio #28: navigation invalidates the page-audio session and its frame records', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://player.example/a';
+  const pageB = 'https://player.example/b';
+  setTab(tabId, pageA);
+  await enablePageAudio(tabId, 200);
+
+  setTab(tabId, pageB);
+  await fireCommitted(tabId, pageB);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.notEqual(state.data.state, 'active', 'the old session did not survive navigation');
+  assert.equal(tabCaptureCalls, 0, 'navigation handling never involved capture');
+});
+
+test('page-audio #29: Disable returns the page gain to 1.0 without tearing down playback', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch');
+  await enablePageAudio(tabId, 250);
+  assert.equal(pageGainFor(tabId), 250);
+
+  const stop = await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  assert.equal(stop.ok, true);
+  assert.equal(pageGainFor(tabId), 100, 'gain returned to exactly 100% (1.0)');
+  assert.equal(pageControllers.get(`${tabId}:0`).observersDisposed, true, 'the observer was released');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.notEqual(state.data.state, 'active');
+  assert.equal(tabCaptureCalls, 0);
+});
+
+test('page-audio #31: Saved-pages live gain reaches a page-audio session and updates the popup', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/saved';
+  setTab(tabId, pageKey, 'Saved Film');
+  await addAndAssertSaved(pageKey, 100);
+  await enablePageAudio(tabId, 100);
+
+  capturedBroadcasts.length = 0;
+  const response = await send(
+    MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN,
+    { pageKey, gainPercent: 275 },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  assert.equal(pageGainFor(tabId), 275, 'the page-audio session followed the Saved-pages slider');
+
+  const popupStates = broadcastsTo(TARGETS.POPUP, MESSAGE_TYPES.TAB_STATE_CHANGED).filter(
+    (b) => b.payload.tabId === tabId && b.payload.gainPercent === 275
+  );
+  assert.ok(popupStates.length >= 1, 'the popup was told about the new gain');
+});
+
+test('page-audio: Reset selected to 100% works for a page-audio session and keeps it running', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/reset';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 260);
+  await enablePageAudio(tabId, 260);
+
+  const response = await send(
+    MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
+    { pageKeys: [pageKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.results, [{ pageKey, ok: true }]);
+  assert.equal(pageGainFor(tabId), 100, 'page gain is now 1.0');
+  assert.equal((await savedVolumes())[pageKey], 100, 'the preference was committed');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active', 'still boosting - a reset is not a stop');
+  assert.equal(state.data.backend, 'page-audio');
+});
+
+test('page-audio: Delete selected stops a page-audio session and removes the record', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/delete';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 150);
+  await enablePageAudio(tabId, 150);
+
+  const response = await send(MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES, { pageKeys: [pageKey] }, OPTIONS_TEST_SENDER);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.results, [{ pageKey, ok: true }]);
+  assert.equal(pageGainFor(tabId), 100, 'the page was returned to neutral gain');
+  assert.equal(pageKey in (await savedVolumes()), false, 'the record is gone');
+});
+
+test('page-audio #32/#33: exact-page matching is unchanged and a temporary session persists nothing', async () => {
+  resetEverything();
+  const tabA = freshTabId();
+  const tabB = freshTabId();
+  const pageA = 'https://same-host.example/one';
+  const pageB = 'https://same-host.example/two';
+  setTab(tabA, pageA);
+  setTab(tabB, pageB);
+
+  await enablePageAudio(tabA, 240);
+  await enablePageAudio(tabB, 120);
+
+  assert.equal(pageGainFor(tabA), 240);
+  assert.equal(pageGainFor(tabB), 120, 'a different exact path is an entirely separate session');
+  assert.deepEqual(await savedVolumes(), {}, 'a temporary page-audio session writes nothing to storage');
+});
+
+test('page-audio #35: START_PAGE_AUDIO is popup-only and payload-validated', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/watch');
+
+  const wrongSender = await send(MESSAGE_TYPES.START_PAGE_AUDIO, startPayload(tabId, 150), OPTIONS_TEST_SENDER);
+  assert.equal(wrongSender.ok, false, 'the options page may not start a tab session');
+  assert.equal(wrongSender.error.code, ERROR_CODES.INVALID_MESSAGE);
+
+  const { validateMessage } = await import('../shared/validation.js');
+  const base = { target: TARGETS.SERVICE_WORKER, type: MESSAGE_TYPES.START_PAGE_AUDIO, requestId: 'r' };
+  assert.equal(validateMessage({ ...base, payload: { tabId, expectedPageKey: 'x', initialGainPercent: 100 } }).ok, true);
+  assert.equal(validateMessage({ ...base, payload: { tabId: null, expectedPageKey: 'x', initialGainPercent: 100 } }).ok, false);
+  assert.equal(validateMessage({ ...base, payload: { tabId, initialGainPercent: 100 } }).ok, false, 'expectedPageKey required');
+  assert.equal(validateMessage({ ...base, payload: { tabId, expectedPageKey: 'x' } }).ok, false, 'gain required');
+});
+
+test('page-audio: a navigation race still returns PAGE_CHANGED and starts nothing', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://player.example/a';
+  const pageB = 'https://player.example/b';
+  setTab(tabId, pageA);
+  setTab(tabId, pageB); // the tab moved on before the click was processed
+
+  const response = await send(MESSAGE_TYPES.START_PAGE_AUDIO, {
+    tabId,
+    expectedPageKey: pageA,
+    initialGainPercent: 200,
+  });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.PAGE_CHANGED);
+  assert.equal(tabCaptureCalls, 0);
+  assert.equal(executeScriptCalls.length, 0, 'nothing was injected for a page the user did not act on');
+});
+
+test('page-audio #34: the compatibility backend still behaves exactly as before', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://compat.example/watch';
+  setTab(tabId, pageKey);
+  await addAndAssertSaved(pageKey, 100);
+
+  const started = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 175));
+  assert.equal(started.ok, true);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 175, 'the offscreen graph is used');
+
+  await send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId, gainPercent: 210, expectedOperationId: started.data.operationId });
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 210);
+
+  const stopped = await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  assert.equal(stopped.ok, true);
+  assert.equal(offscreenResponder.sessions.has(tabId), false, 'confirmed teardown still applies');
+});
+
+test('page-audio: a page-audio session survives reconciliation (offscreen knows nothing about it)', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://player.example/reconcile');
+  await enablePageAudio(tabId, 190);
+
+  // Force a reconciliation pass, which rebuilds the cache from the offscreen
+  // document's enumeration - which has no knowledge of page-audio sessions.
+  offscreenDocumentCreated = true;
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+
+  assert.equal(state.data.state, 'active', 'the page-audio session was not wrongly discarded');
+  assert.equal(state.data.backend, 'page-audio');
+  assert.equal(state.data.gainPercent, 190);
 });

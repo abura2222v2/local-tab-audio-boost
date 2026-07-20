@@ -233,3 +233,17 @@ body.busy .popup__button {
 .popup__modal-actions .popup__button {
   flex: 1;
 }
+
+/* Which audio engine is running, plus its caveat when one applies. */
+.popup__mode {
+  font-size: 12px;
+  margin: 8px 0 0;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.popup__mode-note {
+  font-size: 11px;
+  margin: 4px 0 0;
+  color: var(--muted);
+}

@@ -16,6 +16,7 @@ import {
   DEFAULT_VOLUME_PERCENT,
   OFFSCREEN_DOCUMENT_PATH,
   OFFSCREEN_RESPONSE_TIMEOUT_MS,
+  PAGE_AUDIO_RESPONSE_TIMEOUT_MS,
   MIN_GAIN_PERCENT,
   MAX_GAIN_PERCENT,
 } from './shared/constants.js';
@@ -28,6 +29,14 @@ import {
 } from './shared/messages.js';
 import { clampGainPercent, isPlainObject, isNonEmptyString, isValidTabId } from './shared/validation.js';
 import { sanitizeTitleSnapshot, sanitizeCustomName } from './shared/saved-page-metadata.js';
+import {
+  BACKENDS,
+  BRIDGE_COMMANDS,
+  PAGE_AUDIO_STATES,
+  isRunningState,
+  describeRefusal,
+} from './shared/page-audio-policy.js';
+import { createPageAudioRegistry } from './shared/page-audio-session.js';
 import { canonicalizePageKey } from './shared/urls.js';
 import * as settingsStore from './shared/settings.js';
 
@@ -51,8 +60,29 @@ import * as settingsStore from './shared/settings.js';
 // PERSIST_PAGE_VOLUME/UPDATE_SAVED_PAGE_VOLUME write is allowed to succeed.
 // ---------------------------------------------------------------------------
 
-/** @type {Map<number, {operationId: string, pageKey: string|null, state: 'resolving'|'starting'|'active', gainPercent: number}>} */
+// Every session records which BACKEND owns it:
+//   'page-audio'  - fullscreen-compatible, page-local Web Audio, no tabCapture
+//   'tab-capture' - the explicit compatibility backend (offscreen + capture)
+// A session with no `backend` predates this field and is treated as
+// tab-capture, which is what reconciliation reconstructs from the offscreen
+// document's own enumeration.
+/** @type {Map<number, {operationId: string, pageKey: string|null, state: 'resolving'|'starting'|'active', gainPercent: number, backend: string, startedAt: number}>} */
 const sessions = new Map();
+
+/**
+ * Page-audio frame controllers this worker believes are installed. Purely
+ * derived, never persisted, and bounded: navigating or closing a tab drops
+ * every record beneath it (see shared/page-audio-session.js).
+ */
+const pageAudioFrames = createPageAudioRegistry();
+
+function backendOf(entry) {
+  return entry && entry.backend ? entry.backend : BACKENDS.TAB_CAPTURE;
+}
+
+function isPageAudioSession(entry) {
+  return backendOf(entry) === BACKENDS.PAGE_AUDIO;
+}
 
 let reconciliationPromise = null;
 let reconciliationComplete = false;
@@ -253,6 +283,21 @@ async function requestOffscreenTeardown(tabId, { operationId, force = false, rea
   }
   if (!force && operationId && current.operationId !== operationId) {
     return { ok: true, data: { tabId } };
+  }
+
+  // A page-audio session owns no capture stream and no offscreen graph, so the
+  // whole confirmed-STOP_CAPTURE protocol does not apply to it. Teardown means
+  // returning its frames to neutral gain and dropping this worker's records.
+  if (isPageAudioSession(current)) {
+    const owningOperationId = current.operationId;
+    await deactivatePageAudio(tabId, owningOperationId);
+    const stillCurrent = sessions.get(tabId);
+    if (stillCurrent && stillCurrent.operationId === owningOperationId) {
+      sessions.delete(tabId);
+    }
+    pageAudioFrames.removeTab(tabId);
+    void reason;
+    return { ok: true, data: { tabId, backend: BACKENDS.PAGE_AUDIO } };
   }
 
   const { confirmed, response } = await confirmedStopCapture(tabId, { operationId, force, reason });
@@ -471,7 +516,16 @@ async function reconcileState() {
   // Only reached once every candidate has either passed every check or
   // been positively confirmed stopped/cancelled - never a partial/
   // best-effort result.
+  //
+  // Page-audio sessions are deliberately carried across: the offscreen
+  // document has no knowledge of them (they own no capture stream and no
+  // offscreen graph), so its enumeration must never be read as evidence that
+  // they are gone. Their own lifecycle is driven by navigation/tab events.
+  const survivingPageAudio = [...sessions.entries()].filter(([, entry]) => isPageAudioSession(entry));
   sessions.clear();
+  for (const [tabId, entry] of survivingPageAudio) {
+    sessions.set(tabId, entry);
+  }
   for (const [tabId, entry] of reconciled) {
     sessions.set(tabId, entry);
   }
@@ -688,6 +742,9 @@ async function computeTabStateData(tabId) {
     state,
     gainPercent,
     restricted: false,
+    // Which engine owns this tab's session, so the popup can say whether
+    // fullscreen still works normally.
+    backend: matchesEntry ? backendOf(entry) : null,
     // The popup uses this to scope SET_TAB_GAIN/PERSIST_PAGE_VOLUME to the
     // exact session generation it observed - never derived from anything
     // other than this tab's own current cache entry.
@@ -930,6 +987,19 @@ async function beginCaptureForPage(tabId, pageKey, operationId, initialGainPerce
  * claiming a gain that was not applied, and never a broadcast implying one.
  */
 async function applyConfirmedGainToSession(tabId, operationId, clamped) {
+  // Route to whichever backend owns this session. page-audio talks to its
+  // injected frame controllers; tab-capture talks to the offscreen document.
+  const owning = sessions.get(tabId);
+  if (owning && owning.operationId === operationId && isPageAudioSession(owning)) {
+    const confirmed = await setPageAudioGain(tabId, operationId, clamped);
+    if (!confirmed) return false;
+    const current = sessions.get(tabId);
+    if (!current || current.operationId !== operationId) return false;
+    current.gainPercent = clamped;
+    await broadcastTabState(tabId);
+    return true;
+  }
+
   const gainResponse = await sendMessage(TARGETS.OFFSCREEN, MESSAGE_TYPES.SET_TAB_GAIN, {
     tabId,
     gainPercent: clamped,
@@ -1294,7 +1364,17 @@ async function handleSavedPageLiveGain({ pageKey, gainPercent }) {
  */
 async function beginResolvingOperation(tabId) {
   const operationId = createRequestId();
-  sessions.set(tabId, { operationId, pageKey: null, state: 'resolving', gainPercent: DEFAULT_VOLUME_PERCENT });
+  // The backend defaults to tab-capture and is upgraded to page-audio by
+  // handleStartPageAudio once it owns this operation, so a session is never
+  // left without an owning backend.
+  sessions.set(tabId, {
+    operationId,
+    pageKey: null,
+    state: 'resolving',
+    gainPercent: DEFAULT_VOLUME_PERCENT,
+    backend: BACKENDS.TAB_CAPTURE,
+    startedAt: Date.now(),
+  });
 
   function stillResolving() {
     const entry = sessions.get(tabId);
@@ -1337,6 +1417,235 @@ async function beginResolvingOperation(tabId) {
  * bound to this exact operationId as the session's starting gain - see
  * beginCaptureForPage.
  */
+// ---------------------------------------------------------------------------
+// Page-audio backend (fullscreen-compatible).
+//
+// Nothing in this section calls chrome.tabCapture or creates an offscreen
+// document. Injection happens only from an explicit popup action, uses
+// packaged files (never a generated code string), and the service worker stays
+// the sole authority: a page reply can report its own state, but can never
+// supply a tabId, pageKey, operationId, or permission decision.
+// ---------------------------------------------------------------------------
+
+const PAGE_AUDIO_BRIDGE_FILE = 'page-audio/page-audio-bridge.js';
+const PAGE_AUDIO_CONTROLLER_FILE = 'page-audio/page-audio-controller.js';
+
+/** Sends one narrow, validated command to a frame's bridge, always settling. */
+async function sendPageAudioCommand(tabId, frameId, command) {
+  const response = await withTimeout(
+    (async () => {
+      try {
+        return await chrome.tabs.sendMessage(tabId, { target: 'page-audio', command }, { frameId });
+      } catch {
+        return null;
+      }
+    })(),
+    PAGE_AUDIO_RESPONSE_TIMEOUT_MS
+  );
+  if (response === TIMEOUT_SENTINEL || !response) return { ok: false, reason: 'NO_RESPONSE' };
+  return response;
+}
+
+/**
+ * Lists the http/https frames of a tab that are worth trying to inject. Uses
+ * webNavigation frame data (already permitted) rather than the tabs
+ * permission, and never reads a URL for any tab other than the one the user
+ * just acted on.
+ */
+async function listInjectableFrames(tabId) {
+  try {
+    const frames = await chrome.webNavigation.getAllFrames({ tabId });
+    if (!Array.isArray(frames)) return [{ frameId: 0, documentId: undefined }];
+    return frames
+      .filter((frame) => typeof frame.url === 'string' && /^https?:/i.test(frame.url))
+      .map((frame) => ({ frameId: frame.frameId, documentId: frame.documentId }));
+  } catch {
+    // Fall back to the top frame, which activeTab always covers.
+    return [{ frameId: 0, documentId: undefined }];
+  }
+}
+
+/**
+ * Installs the isolated bridge and the MAIN-world controller into one frame.
+ * Both are packaged files; installation is idempotent on the page side, so a
+ * repeat injection finds the existing controller instead of building a second
+ * audio graph.
+ */
+async function injectPageAudioIntoFrame(tabId, frameId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      files: [PAGE_AUDIO_BRIDGE_FILE],
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      files: [PAGE_AUDIO_CONTROLLER_FILE],
+    });
+    return { ok: true };
+  } catch (err) {
+    // A frame this extension cannot script (a cross-origin player iframe with
+    // no granted permission) is reported, never silently escalated.
+    return { ok: false, reason: 'FRAME_NOT_ACCESSIBLE', message: err?.message ?? String(err) };
+  }
+}
+
+/**
+ * Starts the page-audio backend for a tab: inject every reachable http/https
+ * frame, install the controller at the requested gain, and fold the per-frame
+ * outcomes into one honest state. A page whose media cannot be safely routed
+ * reports UNSUPPORTED_MEDIA with a reason - it never falls back on its own.
+ */
+async function activatePageAudio(tabId, operationToken, gainPercent) {
+  const frames = await listInjectableFrames(tabId);
+  const results = [];
+  let inaccessibleFrames = 0;
+
+  for (const { frameId, documentId } of frames) {
+    const injected = await injectPageAudioIntoFrame(tabId, frameId);
+    if (!injected.ok) {
+      inaccessibleFrames += 1;
+      continue;
+    }
+    const response = await sendPageAudioCommand(tabId, frameId, {
+      type: BRIDGE_COMMANDS.INSTALL,
+      operationToken,
+      gainPercent,
+    });
+    if (!response.ok || !response.data) continue;
+
+    const data = response.data;
+    pageAudioFrames.setFrame(tabId, frameId, {
+      documentId,
+      operationToken,
+      state: data.state,
+      gainPercent,
+    });
+    results.push({ frameId, state: data.state, refusals: data.refusals ?? [] });
+  }
+
+  if (results.length === 0) {
+    return {
+      ok: false,
+      state: inaccessibleFrames > 0 ? PAGE_AUDIO_STATES.PERMISSION_REQUIRED : PAGE_AUDIO_STATES.UNSUPPORTED_MEDIA,
+      reason:
+        inaccessibleFrames > 0
+          ? "This page's player is in a frame this extension cannot access."
+          : 'No page audio engine could be installed on this page.',
+    };
+  }
+
+  // Prefer the strongest outcome any frame achieved.
+  const active = results.find((r) => r.state === PAGE_AUDIO_STATES.ACTIVE_WITH_MEDIA);
+  if (active) return { ok: true, state: PAGE_AUDIO_STATES.ACTIVE_WITH_MEDIA };
+
+  const armed = results.find((r) => r.state === PAGE_AUDIO_STATES.ARMED_WAITING_FOR_MEDIA);
+  if (armed) return { ok: true, state: PAGE_AUDIO_STATES.ARMED_WAITING_FOR_MEDIA };
+
+  const suspended = results.find((r) => r.state === PAGE_AUDIO_STATES.CONTEXT_SUSPENDED);
+  if (suspended) return { ok: true, state: PAGE_AUDIO_STATES.CONTEXT_SUSPENDED };
+
+  const refusal = results.flatMap((r) => r.refusals)[0] ?? null;
+  return { ok: false, state: PAGE_AUDIO_STATES.UNSUPPORTED_MEDIA, reason: describeRefusal(refusal) };
+}
+
+/** Applies a confirmed gain to every live frame of a page-audio session. */
+async function setPageAudioGain(tabId, operationToken, gainPercent) {
+  const frames = pageAudioFrames.listFramesForOperation(tabId, operationToken);
+  let anyConfirmed = false;
+  for (const frame of frames) {
+    const response = await sendPageAudioCommand(tabId, frame.frameId, {
+      type: BRIDGE_COMMANDS.SET_GAIN,
+      operationToken,
+      gainPercent,
+    });
+    if (response.ok && response.data && !response.data.rejected) {
+      pageAudioFrames.updateFrameState(tabId, frame.frameId, operationToken, {
+        gainPercent,
+        state: response.data.state,
+      });
+      anyConfirmed = true;
+    }
+  }
+  return anyConfirmed;
+}
+
+/**
+ * Disable for page-audio: return every frame to neutral gain (1.0) and drop
+ * its observer, then forget the frames.
+ *
+ * The AudioContext is deliberately NOT closed. createMediaElementSource
+ * permanently reroutes an element through its context for the document's
+ * lifetime, so closing it would silence media that is still playing. Neutral
+ * gain is audibly identical to the extension not being there, and every
+ * page-side object becomes collectible when the document goes away.
+ */
+async function deactivatePageAudio(tabId, operationToken) {
+  const frames = pageAudioFrames.listFramesForOperation(tabId, operationToken);
+  for (const frame of frames) {
+    await sendPageAudioCommand(tabId, frame.frameId, { type: BRIDGE_COMMANDS.RESET_TO_NEUTRAL, operationToken });
+    await sendPageAudioCommand(tabId, frame.frameId, { type: BRIDGE_COMMANDS.DISPOSE_OBSERVERS, operationToken });
+    pageAudioFrames.removeFrame(tabId, frame.frameId);
+  }
+  return { ok: true };
+}
+
+/**
+ * The ordinary Enable path. Registers a resolving operation first (so a
+ * navigation during URL resolution can still cancel it), verifies the tab is
+ * still on the exact page the popup acted on, then activates page-audio.
+ * A failure here NEVER starts tabCapture - it returns a structured reason so
+ * the popup can offer compatibility mode as a separate, deliberate choice.
+ */
+async function handleStartPageAudio({ tabId, expectedPageKey, initialGainPercent }) {
+  await ensureReconciled();
+  const existing = sessions.get(tabId);
+  if (existing) {
+    return { ok: true, data: { state: existing.state, backend: backendOf(existing) } };
+  }
+
+  const resolution = await beginResolvingOperation(tabId);
+  if (!resolution.ok) {
+    return resolution.stale ? staleResult() : { ok: false, error: resolution.error };
+  }
+  const { operationId, pageKey } = resolution;
+
+  if (pageKey !== expectedPageKey) {
+    const entry = sessions.get(tabId);
+    if (entry && entry.operationId === operationId) sessions.delete(tabId);
+    return { ok: false, error: { code: ERROR_CODES.PAGE_CHANGED, message: 'This page changed before boosting could start.' } };
+  }
+
+  const clamped = clampGainPercent(initialGainPercent) ?? DEFAULT_VOLUME_PERCENT;
+  const entry = sessions.get(tabId);
+  if (entry && entry.operationId === operationId) {
+    entry.backend = BACKENDS.PAGE_AUDIO;
+    entry.gainPercent = clamped;
+  }
+
+  const result = await activatePageAudio(tabId, operationId, clamped);
+
+  const current = sessions.get(tabId);
+  if (!current || current.operationId !== operationId) {
+    // Superseded while injecting - undo whatever this operation installed.
+    await deactivatePageAudio(tabId, operationId);
+    return staleResult();
+  }
+
+  if (!result.ok) {
+    sessions.delete(tabId);
+    pageAudioFrames.removeTab(tabId);
+    return {
+      ok: false,
+      error: { code: ERROR_CODES.PAGE_AUDIO_UNSUPPORTED, message: result.reason, pageAudioState: result.state },
+    };
+  }
+
+  current.state = 'active';
+  current.startedAt = Date.now();
+  return { ok: true, data: { state: 'active', operationId, backend: BACKENDS.PAGE_AUDIO, pageAudioState: result.state } };
+}
+
 async function handleStartCapture({ tabId, expectedPageKey, initialGainPercent }) {
   await ensureReconciled();
   const existing = sessions.get(tabId);
@@ -1408,6 +1717,23 @@ async function handleSetTabGain({ tabId, gainPercent, expectedOperationId }) {
   }
   const operationId = entry.operationId;
   const clamped = clampGainPercent(gainPercent) ?? entry.gainPercent;
+
+  // A page-audio session owns no offscreen graph: its gain lives in the
+  // injected frame controllers. Route there instead, keeping the identical
+  // "only a confirmed change updates the cache" contract.
+  if (isPageAudioSession(entry)) {
+    const confirmedInPage = await setPageAudioGain(tabId, operationId, clamped);
+    if (!confirmedInPage) {
+      return { ok: false, error: { code: ERROR_CODES.CAPTURE_FAILED, message: 'Could not update the volume for this tab.' } };
+    }
+    const currentPage = sessions.get(tabId);
+    if (currentPage && currentPage.operationId === operationId) {
+      currentPage.gainPercent = clamped;
+      broadcastSavedPageLiveGainToOptions(currentPage.pageKey, clamped);
+    }
+    return { ok: true, data: { tabId, gainPercent: clamped } };
+  }
+
   // The local cache is the value the popup will read back on its next
   // GET_TAB_STATE - it must never claim a gain was applied that the
   // offscreen document did not positively confirm. Sent BEFORE any local
@@ -1537,6 +1863,8 @@ async function handleMessage(message) {
       return handleResetSelectedSavedPagesTo100(message.payload);
     case MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES:
       return handleDeleteSelectedSavedPages(message.payload);
+    case MESSAGE_TYPES.START_PAGE_AUDIO:
+      return handleStartPageAudio(message.payload);
     case MESSAGE_TYPES.START_CAPTURE:
       return handleStartCapture(message.payload);
     case MESSAGE_TYPES.STOP_CAPTURE:
@@ -1567,6 +1895,7 @@ const POPUP_ONLY_MESSAGE_TYPES = new Set([
   MESSAGE_TYPES.GET_TAB_STATE,
   MESSAGE_TYPES.ADD_CURRENT_PAGE,
   MESSAGE_TYPES.ADD_PAGE_MANUAL,
+  MESSAGE_TYPES.START_PAGE_AUDIO,
   MESSAGE_TYPES.START_CAPTURE,
   MESSAGE_TYPES.STOP_CAPTURE,
   MESSAGE_TYPES.SET_TAB_GAIN,
@@ -1612,8 +1941,16 @@ registerMessageHandler(TARGETS.SERVICE_WORKER, handleMessage, { validateSender: 
 // ---------------------------------------------------------------------------
 
 async function handleFullNavigation(details) {
-  if (details.frameId !== 0) return;
+  // A subframe navigating destroys only that frame's page-audio controller.
+  // The old document is gone, so its record must not survive to receive a
+  // command intended for the document that replaced it.
+  if (details.frameId !== 0) {
+    pageAudioFrames.invalidateFrame(details.tabId, details.frameId);
+    return;
+  }
   await ensureReconciled();
+  // A top-level navigation invalidates every frame record for the tab.
+  pageAudioFrames.invalidateTab(details.tabId);
   const entry = sessions.get(details.tabId);
   if (!entry) return;
   await requestOffscreenTeardown(details.tabId, {
@@ -1627,6 +1964,9 @@ async function handleSameDocumentNavigation(details) {
   await ensureReconciled();
   const entry = sessions.get(details.tabId);
   if (!entry) return;
+  // Same-document route changes keep the document (and therefore the page
+  // controller) alive, so frame records survive here - only a genuine exact
+  // pageKey change below tears the session down.
   if (entry.pageKey !== null) {
     const result = canonicalizePageKey(details.url);
     if (result.ok && result.pageKey === entry.pageKey) return;
@@ -1638,6 +1978,9 @@ async function handleSameDocumentNavigation(details) {
 }
 
 async function handleTabRemoved(tabId) {
+  // A closed tab can hold no page-audio controller, so drop every record for
+  // it unconditionally - the registry must never retain a dead tab.
+  pageAudioFrames.removeTab(tabId);
   await ensureReconciled();
   const entry = sessions.get(tabId);
   if (!entry) return;

@@ -14,6 +14,10 @@ const els = {
   manualAddButton: document.getElementById('manual-add-button'),
   savedPagesButton: document.getElementById('saved-pages-button'),
   toggleButton: document.getElementById('toggle-button'),
+  modeLine: document.getElementById('mode-line'),
+  modeNote: document.getElementById('mode-note'),
+  compatArea: document.getElementById('compat-area'),
+  compatButton: document.getElementById('compat-button'),
   messageArea: document.getElementById('message-area'),
   manualAddOverlay: document.getElementById('manual-add-overlay'),
   manualModalPanel: document.querySelector('#manual-add-overlay .popup__modal'),
@@ -30,6 +34,8 @@ let currentTabId = null;
 let currentPageKey = null;
 let currentSaved = false;
 let currentCaptureState = 'inactive';
+let currentBackend = null;
+let compatibilityOffered = false;
 let busy = false;
 
 function setMessage(text, isError = false) {
@@ -47,7 +53,10 @@ function setBusy(isBusy) {
 // is a thin adapter: it wires DOM events to the controller and lends the
 // controller its message-sending and slider-display primitives.
 const controller = createPopupController({
-  startCapture: (payload) => sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.START_CAPTURE, payload),
+  // An ordinary Enable (or a first slider move) always requests the
+  // fullscreen-compatible page-audio backend. Compatibility capture is never
+  // started from here - only from the separate button below.
+  startCapture: (payload) => sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.START_PAGE_AUDIO, payload),
   setLiveGain: ({ tabId, gainPercent, operationId }) =>
     sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.SET_TAB_GAIN, {
       tabId,
@@ -100,6 +109,9 @@ function renderChrome(state) {
   els.addButton.hidden = currentSaved;
   els.addButton.disabled = busy;
 
+  currentBackend = state.backend ?? null;
+  renderMode(state);
+
   if (state.state === 'active') {
     els.statusLine.textContent = 'Boosting active';
     els.toggleButton.textContent = 'Disable boosting';
@@ -113,6 +125,39 @@ function renderChrome(state) {
     els.toggleButton.textContent = 'Enable boosting';
     els.toggleButton.disabled = busy;
   }
+}
+
+/**
+ * Shows which engine owns the session. The fullscreen caveat is attached only
+ * to compatibility capture - fullscreen-compatible mode never shows it.
+ */
+function renderMode(state) {
+  const active = state.state === 'active';
+  if (!active || !state.backend) {
+    els.modeLine.hidden = true;
+    els.modeNote.hidden = true;
+    return;
+  }
+  if (state.backend === 'page-audio') {
+    els.modeLine.textContent = 'Mode: Fullscreen-compatible';
+    els.modeLine.hidden = false;
+    els.modeNote.hidden = true;
+    return;
+  }
+  els.modeLine.textContent = 'Mode: Compatibility capture';
+  els.modeLine.hidden = false;
+  els.modeNote.textContent = 'Fullscreen may remain inside the browser tab.';
+  els.modeNote.hidden = false;
+}
+
+/**
+ * Offers compatibility capture as a SEPARATE, deliberate action after
+ * page-audio reported a structured reason it cannot run. Nothing here starts
+ * capture on its own.
+ */
+function offerCompatibility(show) {
+  compatibilityOffered = show;
+  els.compatArea.hidden = !show;
 }
 
 function applyState(state) {
@@ -167,11 +212,29 @@ els.addButton.addEventListener('click', () => {
 });
 
 els.toggleButton.addEventListener('click', () => {
-  withBusy(() => {
+  withBusy(async () => {
     if (currentCaptureState === 'active') {
+      offerCompatibility(false);
       return sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.STOP_CAPTURE, { tabId: currentTabId });
     }
-    return controller.onEnableClick();
+    const response = await controller.onEnableClick();
+    // page-audio could not run: show the real reason and let the user decide
+    // whether to accept the compatibility trade-off. Never switch silently.
+    offerCompatibility(Boolean(response && !response.ok && response.error?.code === 'PAGE_AUDIO_UNSUPPORTED'));
+    return response;
+  });
+});
+
+// The ONLY control that may start the tabCapture backend.
+els.compatButton.addEventListener('click', () => {
+  withBusy(async () => {
+    const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.START_CAPTURE, {
+      tabId: currentTabId,
+      expectedPageKey: currentPageKey,
+      initialGainPercent: Number(els.slider.value),
+    });
+    if (response.ok) offerCompatibility(false);
+    return response;
   });
 });
 

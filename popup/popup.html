@@ -43,6 +43,22 @@
     <button id="toggle-button" type="button" class="popup__button popup__button--primary">Enable boosting</button>
   </div>
 
+  <!--
+    Which engine is running. Fullscreen-compatible mode keeps the page's own
+    fullscreen working; compatibility capture may not, so it says so.
+  -->
+  <p id="mode-line" class="popup__mode" hidden></p>
+  <p id="mode-note" class="popup__mode-note" hidden></p>
+
+  <!--
+    Shown only after page-audio reported a structured reason it cannot run.
+    Starting the capture backend is always a deliberate, separate choice.
+  -->
+  <div id="compat-area" hidden>
+    <button id="compat-button" type="button" class="popup__button popup__button--secondary">Use compatibility mode</button>
+    <p class="popup__mode-note">Compatibility mode may keep fullscreen inside the browser tab.</p>
+  </div>
+
   <p id="message-area" class="popup__message" role="status"></p>
 </main>
 
