@@ -15,28 +15,75 @@
   </p>
 
   <p class="options__note" role="note">
-    Saving a page only stores its exact URL and a preferred volume - it never starts
-    boosting on its own. Use the popup's <strong>Enable boosting</strong> button (or its
-    slider) on the page itself to actually start a session. To save a new page, open the
-    popup on that page and use <strong>Add this page</strong> or <strong>Add URL manually</strong>.
+    Saving a page only stores its exact URL, a preferred volume, and an optional local
+    name - it never starts boosting on its own, and no page is ever fetched. Use the
+    popup's <strong>Enable boosting</strong> button (or its slider) on the page itself to
+    actually start a session. To save a new page, open the popup on that page and use
+    <strong>Add this page</strong> or <strong>Add URL manually</strong>.
   </p>
 
-  <p id="list-error" class="options__error" role="alert"></p>
+  <p id="list-error" class="options__error" role="alert" aria-live="assertive"></p>
+
+  <section class="options__toolbar" aria-label="Search and bulk actions">
+    <div class="options__search-row">
+      <label class="options__search-label" for="search-input">Search saved pages</label>
+      <input
+        id="search-input"
+        type="search"
+        class="options__search-input"
+        placeholder="Search saved pages..."
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+
+    <div class="options__select-row">
+      <input type="checkbox" id="select-all-visible" class="options__checkbox" />
+      <label for="select-all-visible">Select all visible</label>
+      <span id="selection-summary" class="options__selection-summary" aria-live="polite">Selected: none</span>
+    </div>
+
+    <div class="options__bulk-row">
+      <button id="reset-selected" type="button" class="options__button options__button--secondary" disabled>
+        Reset selected to 100%
+      </button>
+      <button id="delete-selected" type="button" class="options__button options__button--danger" disabled>
+        Delete selected
+      </button>
+      <button id="clear-selection" type="button" class="options__button options__button--secondary" disabled>
+        Clear selection
+      </button>
+    </div>
+
+    <div id="bulk-delete-confirm" class="options__confirm" hidden>
+      <span id="bulk-delete-confirm-text"></span>
+      <button id="bulk-delete-confirm-yes" type="button" class="options__button options__button--danger">Yes, delete selected</button>
+      <button id="bulk-delete-confirm-cancel" type="button" class="options__button options__button--secondary">Cancel</button>
+    </div>
+  </section>
 
   <ul id="page-list" class="options__list" aria-label="Saved pages"></ul>
 
   <p id="empty-state" class="options__empty" hidden>No pages are saved yet.</p>
+  <p id="no-matches" class="options__empty" hidden>No saved pages match this search.</p>
 
-  <div class="options__clear-row">
-    <button id="clear-button" type="button" class="options__button options__button--secondary">
-      Clear all saved pages
-    </button>
-    <div id="clear-confirm" class="options__clear-confirm" hidden>
-      <span>Are you sure? This removes every saved page.</span>
-      <button id="clear-confirm-yes" type="button" class="options__button options__button--danger">Yes, clear all</button>
-      <button id="clear-confirm-cancel" type="button" class="options__button options__button--secondary">Cancel</button>
+  <section class="options__danger" aria-label="Danger zone">
+    <h2 class="options__danger-heading">Danger zone</h2>
+    <p class="options__note">
+      This removes <strong>every</strong> saved page, not only the ones currently shown by
+      the search or selected.
+    </p>
+    <div class="options__clear-row">
+      <button id="clear-button" type="button" class="options__button options__button--secondary">
+        Clear all saved pages
+      </button>
+      <div id="clear-confirm" class="options__confirm" hidden>
+        <span>Are you sure? This removes every saved page.</span>
+        <button id="clear-confirm-yes" type="button" class="options__button options__button--danger">Yes, clear all</button>
+        <button id="clear-confirm-cancel" type="button" class="options__button options__button--secondary">Cancel</button>
+      </div>
     </div>
-  </div>
+  </section>
 </main>
 <script type="module" src="options.js"></script>
 </body>

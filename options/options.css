@@ -121,18 +121,23 @@ h1 {
 .options__list-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   padding: 10px 0;
   border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
 }
 
+/*
+ * The full exact URL is always available as the element's title text (and is
+ * never altered); it is only visually truncated here.
+ */
 .options__page-key {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-size: 13px;
+  font-size: 11px;
+  color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 100%;
 }
 
 .options__row-slider {
@@ -174,15 +179,167 @@ h1 {
 }
 
 .options__clear-row {
-  margin-top: 24px;
+  margin-top: 12px;
+}
+
+/*
+ * Both confirmation panels (bulk delete, clear all). `display: flex` here is
+ * exactly the author rule that the `[hidden]` rule above must override.
+ */
+.options__confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+/* --- Toolbar: search, selection, bulk actions --- */
+
+.options__toolbar {
+  margin-top: 20px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.options__search-label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.options__search-input {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+}
+
+.options__search-input:focus-visible,
+.options__checkbox:focus-visible,
+.options__rename-input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.options__select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.options__selection-summary {
+  color: var(--muted);
+  margin-left: auto;
+}
+
+.options__bulk-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.options__button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.options__checkbox {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  flex: 0 0 auto;
+}
+
+/* --- Rows --- */
+
+.options__row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.options__display-name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.options__status {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* An active row is marked with text, never by color alone. */
+.options__status--active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.options__rename-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.options__rename-input {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+}
+
+.options__row-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.options__small-button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.options__small-button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* --- Danger zone --- */
+
+.options__danger {
+  margin-top: 28px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
 }
 
-.options__clear-confirm {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  font-size: 13px;
+.options__danger-heading {
+  font-size: 14px;
+  margin: 0 0 8px;
 }

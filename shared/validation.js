@@ -6,10 +6,13 @@ import {
   MESSAGE_TYPES,
   MIN_GAIN_PERCENT,
   MAX_GAIN_PERCENT,
+  MAX_BULK_PAGE_KEYS,
+  MAX_CUSTOM_NAME_LENGTH,
   ERROR_CODES,
   SESSION_STOP_REASONS,
 } from './constants.js';
 import { canonicalizePageKey } from './urls.js';
+import { normalizeSavedPageRecord } from './saved-page-metadata.js';
 
 export function isValidTarget(value) {
   return Object.values(TARGETS).includes(value);
@@ -101,9 +104,15 @@ const SERVICE_WORKER_PAYLOAD_VALIDATORS = {
   [MESSAGE_TYPES.ADD_CURRENT_PAGE]: (p) =>
     isPlainObject(p) && isValidTabId(p.tabId) && isNonEmptyString(p.expectedPageKey) && typeof p.gainPercent === 'number',
   // `gainPercent` is optional here (the "Add URL manually" modal's initial
-  // volume) - a missing value defaults to 100% in the handler.
+  // volume) - a missing value defaults to 100% in the handler. `customName` is
+  // the modal's optional local name field: absent or a string within the
+  // stored maximum. A manually added URL is NEVER fetched, so it never gets a
+  // titleSnapshot - only this optional name.
   [MESSAGE_TYPES.ADD_PAGE_MANUAL]: (p) =>
-    isPlainObject(p) && isNonEmptyString(p.rawUrl) && (p.gainPercent === undefined || typeof p.gainPercent === 'number'),
+    isPlainObject(p) &&
+    isNonEmptyString(p.rawUrl) &&
+    (p.gainPercent === undefined || typeof p.gainPercent === 'number') &&
+    (p.customName === undefined || (typeof p.customName === 'string' && p.customName.length <= MAX_CUSTOM_NAME_LENGTH)),
   [MESSAGE_TYPES.REMOVE_SAVED_PAGE]: (p) => isPlainObject(p) && isNonEmptyString(p.pageKey),
   [MESSAGE_TYPES.CLEAR_SAVED_PAGES]: (p) => isPlainObject(p),
   // Saved-pages-view -> service worker, direct pageKey update - never
@@ -116,6 +125,19 @@ const SERVICE_WORKER_PAYLOAD_VALIDATORS = {
   // out-of-range/non-integer gain is rejected outright rather than clamped, so
   // a stray live message can never drive audio to an unintended value.
   [MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN]: (p) => isPlainObject(p) && isNonEmptyString(p.pageKey) && isValidGainPercent(p.gainPercent),
+  // Saved-pages-view -> service worker: sets ONE page's local customName.
+  // `customName` must be a string (an EMPTY string is valid and clears the
+  // override) and must not exceed the stored maximum before sanitization -
+  // an over-long name is rejected outright rather than silently truncated.
+  [MESSAGE_TYPES.RENAME_SAVED_PAGE]: (p) =>
+    isPlainObject(p) &&
+    isNonEmptyString(p.pageKey) &&
+    typeof p.customName === 'string' &&
+    p.customName.length <= MAX_CUSTOM_NAME_LENGTH,
+  // Saved-pages-view -> service worker: bulk operations over an explicit,
+  // fully-validated list of canonical exact pageKeys (see isValidPageKeyList).
+  [MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100]: (p) => isPlainObject(p) && isValidPageKeyList(p.pageKeys),
+  [MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES]: (p) => isPlainObject(p) && isValidPageKeyList(p.pageKeys),
   // START_CAPTURE carries the popup's last server-derived `expectedPageKey`
   // (never trusted as URL authority - only compared against a freshly
   // re-derived pageKey in handleStartCapture) so a click/slider observed on
@@ -217,8 +239,20 @@ export function validateMessage(message) {
 }
 
 /**
- * Recovers a malformed/legacy savedPages storage value into a safe map whose
- * every key is a genuine canonical exact-page key.
+ * Recovers a malformed/legacy savedPages storage value into a safe SCHEMA-6
+ * map whose every key is a genuine canonical exact-page key and whose every
+ * value is a well-formed `{volumePercent, titleSnapshot, customName}` record.
+ *
+ * This is the single normalization used for BOTH a defensive read of a
+ * schema-6 profile and the schema-5 -> schema-6 migration, because
+ * normalizeSavedPageRecord (shared/saved-page-metadata.js) accepts either
+ * representation:
+ *   - a bare number (schema 5) becomes a record with empty metadata;
+ *   - a schema-6 object is validated and sanitized, and any unrecognized
+ *     property is dropped rather than trusted.
+ * An entry whose value cannot yield a valid record (bad type, non-integer or
+ * out-of-range volume) is ignored entirely, exactly as an out-of-range number
+ * was ignored under schema 5.
  *
  * Every candidate key is run through the single canonical matcher
  * (canonicalizePageKey in shared/urls.js - never re-implemented here), and
@@ -228,21 +262,44 @@ export function validateMessage(message) {
  * default-port or hostname-case variant collapses onto its canonical key.
  *
  * Canonical collisions (two raw keys mapping to the same canonical key) are
- * resolved deterministically: the first one encountered in the input's own
- * key order wins, and later duplicates are ignored. Exact path/query/
- * fragment differences are preserved verbatim by canonicalizePageKey, so
- * genuinely distinct pages never collide.
+ * resolved deterministically: the FIRST valid canonical entry encountered in
+ * the input's own key order wins, and later duplicates are ignored. Exact
+ * path/query/fragment differences are preserved verbatim by
+ * canonicalizePageKey, so genuinely distinct pages never collide.
  */
 export function normalizeSavedPages(value) {
   if (!isPlainObject(value)) return {};
   const result = {};
-  for (const [rawKey, volumePercent] of Object.entries(value)) {
-    if (!isValidGainPercent(volumePercent)) continue;
+  for (const [rawKey, storedValue] of Object.entries(value)) {
+    const record = normalizeSavedPageRecord(storedValue);
+    if (record === null) continue;
     const canonical = canonicalizePageKey(rawKey);
     if (!canonical.ok) continue;
     if (!(canonical.pageKey in result)) {
-      result[canonical.pageKey] = volumePercent;
+      result[canonical.pageKey] = record;
     }
   }
   return result;
+}
+
+/**
+ * Validates a bulk operation's `pageKeys` array (RESET_SELECTED_SAVED_PAGES_TO_100
+ * / DELETE_SELECTED_SAVED_PAGES). An options-page-supplied list is never
+ * trusted: every entry must be a string that canonicalizes to exactly itself,
+ * so a non-canonical, restricted, credentialed, or unsupported URL can never
+ * enter a bulk operation. Also rejects a non-array, an empty array, an
+ * oversized batch, and duplicates.
+ */
+export function isValidPageKeyList(value) {
+  if (!Array.isArray(value)) return false;
+  if (value.length === 0 || value.length > MAX_BULK_PAGE_KEYS) return false;
+  const seen = new Set();
+  for (const entry of value) {
+    if (!isNonEmptyString(entry)) return false;
+    const canonical = canonicalizePageKey(entry);
+    if (!canonical.ok || canonical.pageKey !== entry) return false;
+    if (seen.has(entry)) return false;
+    seen.add(entry);
+  }
+  return true;
 }

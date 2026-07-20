@@ -11,7 +11,18 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TARGETS, MESSAGE_TYPES, ERROR_CODES, OFFSCREEN_DOCUMENT_PATH, DEFAULT_VOLUME_PERCENT } from '../shared/constants.js';
+import {
+  TARGETS,
+  MESSAGE_TYPES,
+  ERROR_CODES,
+  OFFSCREEN_DOCUMENT_PATH,
+  DEFAULT_VOLUME_PERCENT,
+  MAX_TITLE_SNAPSHOT_LENGTH,
+  MAX_CUSTOM_NAME_LENGTH,
+  MAX_BULK_PAGE_KEYS,
+} from '../shared/constants.js';
+import { getDisplayName } from '../shared/saved-page-metadata.js';
+import { filterSavedPageKeys } from '../shared/saved-pages-search.js';
 import { registerMessageHandler, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
 import { canonicalizePageKey } from '../shared/urls.js';
 import { createPopupController } from '../shared/popup-controller.js';
@@ -393,6 +404,20 @@ listeners.push((message, sender, sendResponse) => {
 const settings = await import('../shared/settings.js');
 const sw = await import('../service-worker.js');
 
+/**
+ * Schema 6 stores each saved page as a record ({volumePercent, titleSnapshot,
+ * customName}). Most assertions in this file only care about the VOLUME, so
+ * this projects the authoritative record map down to the {pageKey: percent}
+ * shape those assertions were written against. Tests that specifically care
+ * about metadata call settings.getSavedPages() directly and assert on the
+ * record fields.
+ */
+async function savedVolumes() {
+  const pages = await settings.getSavedPages();
+  return Object.fromEntries(Object.entries(pages).map(([key, record]) => [key, record.volumePercent]));
+}
+
+
 // ---------------------------------------------------------------------------
 // Test helpers.
 // ---------------------------------------------------------------------------
@@ -403,8 +428,8 @@ function freshTabId() {
   return nextTabId;
 }
 
-function setTab(tabId, url) {
-  tabsData.set(tabId, { id: tabId, url });
+function setTab(tabId, url, title = '') {
+  tabsData.set(tabId, { id: tabId, url, title });
 }
 
 function removeTabData(tabId) {
@@ -530,11 +555,20 @@ function tick(ms = 0) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Every offscreen round trip in the service worker is bounded by this value.
+// Tests drive the real timeout code paths off a short, CONTROLLED timeout
+// rather than the production 1500ms, so a timeout-path assertion needs a few
+// hundred milliseconds instead of several seconds - and its margin is a large
+// multiple of the timeout, which is what makes it deterministic rather than
+// dependent on how loaded the machine happens to be.
+const TEST_OFFSCREEN_TIMEOUT_MS = 60;
+
 function resetEverything() {
   storageBackingStore = {};
   storageSetGate = null;
   settings.__resetForTests();
   sw.__resetForTests();
+  sw.__setOffscreenResponseTimeoutForTests(TEST_OFFSCREEN_TIMEOUT_MS);
   offscreenResponder.reset();
   tabsData = new Map();
   capturedTabsData = [];
@@ -670,7 +704,7 @@ test('unsaved boost #1: Enable at 100% on an unsaved inactive page becomes activ
   assert.equal(offscreenResponder.sessions.has(tabId), true, 'a session started');
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 100, 'GainNode gain 1.0 (100%)');
   assert.equal(popup.state().captureState, 'active', 'popup changed to active only after confirmed success');
-  assert.deepEqual(await settings.getSavedPages(), {}, 'no savedPages entry created');
+  assert.deepEqual(await savedVolumes(), {}, 'no savedPages entry created');
 });
 
 test('unsaved boost #2: first slider input 155% on an unsaved inactive page becomes active at gain 1.55', async () => {
@@ -688,7 +722,7 @@ test('unsaved boost #2: first slider input 155% on an unsaved inactive page beco
   assert.equal(offscreenResponder.sessions.has(tabId), true);
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 155, 'offscreen GainNode at 155% (1.55)');
   assert.equal(popup.getDisplay(), 155, 'final slider position equals the live gain');
-  assert.deepEqual(await settings.getSavedPages(), {}, 'no savedPages entry created');
+  assert.deepEqual(await savedVolumes(), {}, 'no savedPages entry created');
 });
 
 test('unsaved boost #3: first slider input BELOW 100% (50%) also starts capture, at gain 0.5', async () => {
@@ -768,7 +802,7 @@ test('unsaved boost #6/#7: neither slider-start nor Enable creates a savedPages 
   await p1.prime();
   p1.controller.onSliderInput(180);
   await settlePopup();
-  assert.deepEqual(await settings.getSavedPages(), {}, 'slider start creates no savedPages key');
+  assert.deepEqual(await savedVolumes(), {}, 'slider start creates no savedPages key');
 
   resetEverything();
   const enableTabId = freshTabId();
@@ -777,7 +811,7 @@ test('unsaved boost #6/#7: neither slider-start nor Enable creates a savedPages 
   await p2.prime();
   await p2.controller.onEnableClick();
   await settlePopup();
-  assert.deepEqual(await settings.getSavedPages(), {}, 'Enable creates no savedPages key');
+  assert.deepEqual(await savedVolumes(), {}, 'Enable creates no savedPages key');
 });
 
 test('unsaved boost #8: change / pagehide on an unsaved active session writes nothing to storage', async () => {
@@ -796,7 +830,7 @@ test('unsaved boost #8: change / pagehide on an unsaved active session writes no
   popup.controller.flushFallback(); // pagehide
   await settlePopup();
 
-  assert.deepEqual(await settings.getSavedPages(), {}, 'no persistent write for an unsaved page');
+  assert.deepEqual(await savedVolumes(), {}, 'no persistent write for an unsaved page');
   // But the live gain did follow the committed value.
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 175);
 });
@@ -979,7 +1013,7 @@ test('unsaved boost #18: after Enable at 100%, moving to 155% updates the real o
   popup.controller.onSliderInput(155);
   await settlePopup();
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 155, 'the live offscreen session followed the slider');
-  assert.deepEqual(await settings.getSavedPages(), {}, 'still nothing persisted for the unsaved page');
+  assert.deepEqual(await savedVolumes(), {}, 'still nothing persisted for the unsaved page');
 });
 
 // ===========================================================================
@@ -1028,7 +1062,7 @@ test('required#2: an unsaved page can start temporary capture from its first sli
   });
   assert.equal(gainResponse.ok, true);
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 137);
-  assert.deepEqual(await settings.getSavedPages(), {}, 'never saved merely by starting a temporary session from the slider');
+  assert.deepEqual(await savedVolumes(), {}, 'never saved merely by starting a temporary session from the slider');
 });
 
 test('required#3: unsaved slider input (SET_TAB_GAIN) never writes storage, and an unsaved PERSIST_PAGE_VOLUME never creates an entry', async () => {
@@ -1041,7 +1075,7 @@ test('required#3: unsaved slider input (SET_TAB_GAIN) never writes storage, and 
   for (const value of [120, 80, 160, 100]) {
     const response = await send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId, gainPercent: value, expectedOperationId: data.operationId });
     assert.equal(response.ok, true);
-    assert.deepEqual(await settings.getSavedPages(), {}, `storage must stay empty after live gain ${value}`);
+    assert.deepEqual(await savedVolumes(), {}, `storage must stay empty after live gain ${value}`);
   }
 
   // Defense in depth: even if the popup mistakenly sent PERSIST_PAGE_VOLUME
@@ -1050,7 +1084,7 @@ test('required#3: unsaved slider input (SET_TAB_GAIN) never writes storage, and 
   const persistResponse = await send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, { tabId, gainPercent: 150, expectedOperationId: data.operationId });
   assert.equal(persistResponse.ok, false);
   assert.equal(persistResponse.error.code, ERROR_CODES.PAGE_NOT_SAVED);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('required#4: an unsaved session survives "popup closure" (no message sent) and reopening shows the actual live gain', async () => {
@@ -1096,7 +1130,7 @@ test('required#6/#7: an unsaved (temporary) session is reconstructed safely afte
   const pageKey = 'https://temp-reconciled.example/';
   setTab(tabId, pageKey);
   await enableTab(tabId);
-  assert.deepEqual(await settings.getSavedPages(), {}, 'genuinely never saved');
+  assert.deepEqual(await savedVolumes(), {}, 'genuinely never saved');
 
   // Simulates a real service-worker restart: the in-memory cache is wiped,
   // but the offscreen document's own real state (and Chrome's tabCapture
@@ -1124,7 +1158,7 @@ test('fix1: PERSIST_PAGE_VOLUME is rejected when the tab has no active session a
   const response = await send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, { tabId, gainPercent: 150, expectedOperationId: 'irrelevant' });
   assert.equal(response.ok, false);
   assert.equal(response.error.code, ERROR_CODES.NOT_ACTIVE);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('fix1: a delayed PERSIST_PAGE_VOLUME after Disable is a harmless no-op, never re-adding the page', async () => {
@@ -1145,7 +1179,7 @@ test('fix1: a delayed PERSIST_PAGE_VOLUME after Disable is a harmless no-op, nev
   assert.equal(persistResponse.ok, false);
   assert.equal(persistResponse.error.code, ERROR_CODES.NOT_ACTIVE);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 100); // untouched default, never bumped to 170
 });
 
@@ -1168,7 +1202,7 @@ test('fix1: a delayed PERSIST_PAGE_VOLUME after the page was removed does not re
     expectedOperationId: data.operationId,
   });
   assert.equal(persistResponse.ok, false);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('fix1: a delayed PERSIST_PAGE_VOLUME after navigation to a different page does not persist against the new page', async () => {
@@ -1193,7 +1227,7 @@ test('fix1: a delayed PERSIST_PAGE_VOLUME after navigation to a different page d
   assert.equal(persistResponse.ok, false);
   assert.equal(persistResponse.error.code, ERROR_CODES.NOT_ACTIVE);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[oldPageKey], 100);
   assert.equal(pages[newPageKey], 100);
 });
@@ -1216,7 +1250,7 @@ test('fix1: a valid persist on a genuinely active session still updates every se
   });
   assert.equal(persistResponse.ok, true);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 165);
   assert.equal(offscreenResponder.sessions.get(tabA).gainPercent, 165);
   assert.equal(offscreenResponder.sessions.get(tabB).gainPercent, 165);
@@ -1691,7 +1725,7 @@ test('r2fix1: navigation where STOP_CAPTURE never resolves still reaches closeDo
   // need headroom beyond the exact sum, not just enough for the ideal
   // case - see the identically-shaped r3fix4 "navigation listener" test
   // below, which budgets 4200ms for the same two-chained-timeout shape).
-  await tick(4200);
+  await tick(500); // two chained offscreen timeouts (60ms each) + a wide margin
 
   assert.equal(closeDocumentCallCount, 1);
   assert.equal(offscreenResponder.sessions.size, 0);
@@ -1723,7 +1757,7 @@ test('r5-4 #1: REMOVE where the stop returns malformed success leaves the saved 
   const response = await send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, false, 'an unconfirmed teardown must not report success');
   // The saved preference is completely intact - the storage mutation never ran.
-  assert.equal((await settings.getSavedPages())[pageKey], 133);
+  assert.equal((await savedVolumes())[pageKey], 133);
 
   offscreenResponder.setStopCaptureOverride(null);
 });
@@ -1751,7 +1785,7 @@ test('r5-4 #4: CLEAR where one of two stops fails leaves savedPages entirely int
   const response = await send(MESSAGE_TYPES.CLEAR_SAVED_PAGES, {}, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, false, 'CLEAR must not report success when a required stop failed');
   // savedPages is NEVER cleared - both entries survive intact.
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageA], 110);
   assert.equal(pages[pageB], 120);
 
@@ -1769,11 +1803,11 @@ test('r5-4 #2: REMOVE where the stop times out (never resolves) leaves the saved
   offscreenResponder.setStopCaptureOverride(() => new Promise(() => {})); // never resolves
 
   const responsePromise = send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey }, OPTIONS_TEST_SENDER);
-  await tick(3200); // confirm timeout (1500) + emergency force:true timeout (1500) + margin
+  await tick(500); // confirm timeout + emergency force:true timeout + a wide margin
   const response = await responsePromise;
 
   assert.equal(response.ok, false);
-  assert.equal((await settings.getSavedPages())[pageKey], 155, 'the saved entry survives a timed-out teardown');
+  assert.equal((await savedVolumes())[pageKey], 155, 'the saved entry survives a timed-out teardown');
 
   offscreenResponder.setStopCaptureOverride(null);
 });
@@ -1803,7 +1837,7 @@ test('r5-4 #3: REMOVE where the stop reports operation_mismatch returns failure 
 
   const response = await send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, false);
-  assert.equal((await settings.getSavedPages())[pageKey], 145, 'storage intact after an operation_mismatch');
+  assert.equal((await savedVolumes())[pageKey], 145, 'storage intact after an operation_mismatch');
 
   offscreenResponder.setStopCaptureOverride(null);
 });
@@ -1821,7 +1855,7 @@ test('r5-4 #5: a successful REMOVE stops the matching session BEFORE the saved e
   // mutated AFTER a confirmed stop).
   let savedPresentAtStopTime = null;
   offscreenResponder.setStopCaptureOverride(async (payload) => {
-    savedPresentAtStopTime = pageKey in (await settings.getSavedPages());
+    savedPresentAtStopTime = pageKey in (await savedVolumes());
     return offscreenResponder.defaultStopCapture(payload);
   });
 
@@ -1829,7 +1863,7 @@ test('r5-4 #5: a successful REMOVE stops the matching session BEFORE the saved e
   assert.equal(response.ok, true);
   assert.equal(savedPresentAtStopTime, true, 'the saved entry was still present while the session was being stopped');
   assert.equal(offscreenResponder.sessions.has(tabId), false, 'the session was stopped');
-  assert.equal(pageKey in (await settings.getSavedPages()), false, 'the saved entry is gone only after the confirmed stop');
+  assert.equal(pageKey in (await savedVolumes()), false, 'the saved entry is gone only after the confirmed stop');
 
   offscreenResponder.setStopCaptureOverride(null);
 });
@@ -1850,7 +1884,7 @@ test('r5-4 #6: a successful CLEAR stops all snapshot sessions before committing 
   let savedCountAtFirstStop = null;
   offscreenResponder.setStopCaptureOverride(async (payload) => {
     if (savedCountAtFirstStop === null) {
-      savedCountAtFirstStop = Object.keys(await settings.getSavedPages()).length;
+      savedCountAtFirstStop = Object.keys(await savedVolumes()).length;
     }
     return offscreenResponder.defaultStopCapture(payload);
   });
@@ -1859,7 +1893,7 @@ test('r5-4 #6: a successful CLEAR stops all snapshot sessions before committing 
   assert.equal(response.ok, true);
   assert.equal(savedCountAtFirstStop, 2, 'both saved entries were still present while sessions were being stopped');
   assert.equal(offscreenResponder.sessions.size, 0, 'all snapshot sessions stopped');
-  assert.deepEqual(await settings.getSavedPages(), {}, 'storage committed to {} only after every stop');
+  assert.deepEqual(await savedVolumes(), {}, 'storage committed to {} only after every stop');
 
   offscreenResponder.setStopCaptureOverride(null);
 });
@@ -2164,7 +2198,7 @@ test('ADD_CURRENT_PAGE saves the current slider value alongside the URL', async 
   const response = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 165 });
   assert.equal(response.ok, true, `expected ADD_CURRENT_PAGE to succeed: ${JSON.stringify(response)}`);
   assert.equal(response.data.volumePercent, 165);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 165);
 });
 
@@ -2191,7 +2225,7 @@ test('ADD_CURRENT_PAGE upgrades an already-active temporary (unsaved) session wi
   assert.equal(state.data.state, 'active');
   assert.equal(state.data.saved, true, 'now associated with a saved preference');
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 140);
 });
 
@@ -2212,7 +2246,7 @@ test('navigation racing ADD_CURRENT_PAGE saves neither the old nor the destinati
   assert.equal(response.ok, false);
   assert.equal(response.error.code, ERROR_CODES.PAGE_CHANGED);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pageA in pages, false);
   assert.equal(pageB in pages, false);
 });
@@ -2225,7 +2259,7 @@ test('a matching expectedPageKey (no race) still succeeds normally for ADD_CURRE
 
   const addResponse = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 100 });
   assert.equal(addResponse.ok, true);
-  assert.deepEqual(await settings.getSavedPages(), { [pageKey]: 100 });
+  assert.deepEqual(await savedVolumes(), { [pageKey]: 100 });
 });
 
 test('Add this page is idempotent - saving an already-saved page preserves its existing value, never creating a duplicate or silent overwrite', async () => {
@@ -2238,7 +2272,7 @@ test('Add this page is idempotent - saving an already-saved page preserves its e
   const response = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 30 });
   assert.equal(response.ok, true);
   assert.equal(response.data.volumePercent, 155);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 155);
 });
 
@@ -2272,7 +2306,7 @@ test('r2fix3: offscreen START_CAPTURE never resolves - the operation times out a
   });
 
   const startPromise = send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId));
-  await tick(1600); // past the START_CAPTURE confirm timeout (1500ms)
+  await tick(300); // past the START_CAPTURE confirm timeout
 
   const response = await startPromise;
   assert.equal(response.ok, false);
@@ -2307,7 +2341,7 @@ test('r2fix3: offscreen START_CAPTURE never resolves AND its own cleanup also ha
   const startPromise = send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId));
   // START_CAPTURE timeout (1500) + cleanup timeout (1500) + emergency's own
   // per-session force:true STOP_CAPTURE timeout (1500), all real wall-clock.
-  await tick(4700);
+  await tick(600);
 
   const response = await startPromise;
   assert.equal(response.ok, false);
@@ -2337,7 +2371,7 @@ test('r2fix3: a late START_CAPTURE response arriving after the timeout cannot re
   await tick(20); // let the PendingStart actually register at the offscreen layer
   assert.equal(offscreenResponder.pending.has(tabId), true);
 
-  await tick(1600); // past the timeout - cleanup has cancelled the PendingStart by now
+  await tick(300); // past the timeout - cleanup has cancelled the PendingStart by now
   const response = await startPromise;
   assert.equal(response.ok, false);
 
@@ -2473,7 +2507,7 @@ test('r2fix6: a stale expectedOperationId on PERSIST_PAGE_VOLUME is rejected and
     expectedOperationId: oldData.operationId, // stale
   });
   assert.equal(response.ok, false);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 100);
 });
 
@@ -2499,7 +2533,7 @@ test('r2fix6: SET_TAB_GAIN/PERSIST_PAGE_VOLUME with the current operationId stil
     expectedOperationId: data.operationId,
   });
   assert.equal(persistResponse.ok, true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 145);
 });
 
@@ -2541,7 +2575,7 @@ test('REMOVE_SAVED_PAGE removes only the exact pageKey given, regardless of what
   const response = await send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey: pageA }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, true);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pageA in pages, false);
   assert.equal(pageB in pages, true);
 });
@@ -2554,7 +2588,7 @@ test('REMOVE_SAVED_PAGE never removes or affects a different exact URL on the id
   const response = await send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey: 'https://same-host.example/page-a' }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, true);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal('https://same-host.example/page-a' in pages, false);
   assert.equal('https://same-host.example/page-b' in pages, true);
 });
@@ -2593,7 +2627,7 @@ test('required#17: Clear all stops every active session safely (confirmed teardo
   const response = await send(MESSAGE_TYPES.CLEAR_SAVED_PAGES, {}, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, true);
   assert.equal(offscreenResponder.sessions.size, 0);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 
   const stateA = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId: tabA });
   const stateB = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId: tabB });
@@ -2644,7 +2678,7 @@ test('required#20: the main slider value (gainPercent) shows the actual live val
   const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
   assert.equal(state.data.state, 'active');
   assert.equal(state.data.gainPercent, 190, 'the actual live value, not the still-100 saved value');
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 100, 'the saved value itself is untouched by a purely live change');
 });
 
@@ -2710,7 +2744,7 @@ test('required#12: every saved URL has its own independent stored percentage', a
   resetEverything();
   await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: 'https://independent-a.example/', gainPercent: 60 });
   await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: 'https://independent-b.example/', gainPercent: 180 });
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://independent-a.example/'], 60);
   assert.equal(pages['https://independent-b.example/'], 180);
 });
@@ -2725,7 +2759,7 @@ test('UPDATE_SAVED_PAGE_VOLUME updates only that exact URL, never starting a new
     OPTIONS_TEST_SENDER
   );
   assert.equal(response.ok, true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://row-slider-no-capture.example/'], 55);
   assert.equal(offscreenResponder.sessions.size, 0, 'never started a session merely from a saved-pages row update');
   assert.equal(createDocumentCallCount, 0);
@@ -2742,7 +2776,7 @@ test('required#13: UPDATE_SAVED_PAGE_VOLUME never changes a different URL on the
     OPTIONS_TEST_SENDER
   );
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://update-same-host.example/page-a'], 175);
   assert.equal(pages['https://update-same-host.example/page-b'], 100);
 });
@@ -2784,7 +2818,7 @@ test('UPDATE_SAVED_PAGE_VOLUME on a page that is not saved is rejected without c
   );
   assert.equal(response.ok, false);
   assert.equal(response.error.code, ERROR_CODES.PAGE_NOT_SAVED);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test("a failed live UPDATE_SAVED_PAGE_VOLUME propagation never corrupts the stored value or the other tab's local session state", async () => {
@@ -2810,7 +2844,7 @@ test("a failed live UPDATE_SAVED_PAGE_VOLUME propagation never corrupts the stor
   const response = await send(MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, { pageKey, gainPercent: 145 }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, true, 'the storage write itself is unconditional and still succeeds');
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 145);
   assert.equal(offscreenResponder.sessions.get(tabA).gainPercent, 145);
   assert.equal(offscreenResponder.sessions.get(tabB).gainPercent, 100, 'never silently marked updated without offscreen confirmation');
@@ -2833,12 +2867,12 @@ test('sync #5: a popup PERSIST_PAGE_VOLUME commit on a saved page broadcasts the
 
   const response = await send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, { tabId, gainPercent: 175, expectedOperationId: data.operationId });
   assert.equal(response.ok, true);
-  assert.equal((await settings.getSavedPages())[pageKey], 175);
+  assert.equal((await savedVolumes())[pageKey], 175);
 
   const optionsBroadcasts = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED);
   assert.ok(optionsBroadcasts.length >= 1, 'SAVED_PAGES_CHANGED was broadcast to the options view');
   const last = optionsBroadcasts[optionsBroadcasts.length - 1];
-  assert.equal(last.payload.savedPages[pageKey], 175, 'the broadcast carries the authoritative new saved value');
+  assert.equal(last.payload.savedPages[pageKey].volumePercent, 175, 'the broadcast carries the authoritative new saved value');
 });
 
 test('sync #6: a Saved-pages row commit (UPDATE_SAVED_PAGE_VOLUME) updates an active identical-page session\'s offscreen gain', async () => {
@@ -2902,7 +2936,7 @@ test('sync #9: a row commit for one exact URL never changes a different URL on t
   const response = await send(MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, { pageKey: 'https://sync-host.example/a', gainPercent: 260 }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, true);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://sync-host.example/a'], 260);
   assert.equal(pages['https://sync-host.example/b'], 100, 'the sibling exact URL on the same hostname is untouched');
 });
@@ -2921,15 +2955,15 @@ test('sync #10: a ChatGPT popup PERSIST commit does not modify the saved Rezka r
   const response = await send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, { tabId: chatTab, gainPercent: 175, expectedOperationId: data.operationId });
   assert.equal(response.ok, true);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[chatgpt], 175, 'the ChatGPT page updated');
   assert.equal(pages[rezka], 150, 'the saved Rezka row was NOT modified');
 
   // The SAVED_PAGES_CHANGED broadcast reflects the authoritative map: Rezka
   // unchanged, ChatGPT updated.
   const last = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED).slice(-1)[0];
-  assert.equal(last.payload.savedPages[rezka], 150);
-  assert.equal(last.payload.savedPages[chatgpt], 175);
+  assert.equal(last.payload.savedPages[rezka].volumePercent, 150);
+  assert.equal(last.payload.savedPages[chatgpt].volumePercent, 175);
 });
 
 test('sync #11: an unsaved page can be temporarily boosted to 155% - live gain works, no savedPages entry is created, and PERSIST is a rejected no-op', async () => {
@@ -2942,7 +2976,7 @@ test('sync #11: an unsaved page can be temporarily boosted to 155% - live gain w
   const startResp = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 155));
   assert.equal(startResp.ok, true);
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 155, 'live gain is 155%');
-  assert.deepEqual(await settings.getSavedPages(), {}, 'no savedPages entry was created');
+  assert.deepEqual(await savedVolumes(), {}, 'no savedPages entry was created');
 
   // input/change must not persist for an unsaved page: PERSIST is rejected
   // and creates nothing.
@@ -2953,7 +2987,7 @@ test('sync #11: an unsaved page can be temporarily boosted to 155% - live gain w
   });
   assert.equal(persistResp.ok, false);
   assert.equal(persistResp.error.code, ERROR_CODES.PAGE_NOT_SAVED);
-  assert.deepEqual(await settings.getSavedPages(), {}, 'still no savedPages entry');
+  assert.deepEqual(await savedVolumes(), {}, 'still no savedPages entry');
 
   // Reopening the popup during the same active session shows the actual live value.
   const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
@@ -2975,7 +3009,7 @@ test('sync #12: Add this page during an active unsaved 155% session saves that e
   // The popup's slider currently shows 155, so Add this page sends 155.
   const addResp = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 155 });
   assert.equal(addResp.ok, true);
-  assert.equal((await settings.getSavedPages())[pageKey], 155, 'saved at exactly the live 155%');
+  assert.equal((await savedVolumes())[pageKey], 155, 'saved at exactly the live 155%');
 
   // The existing session is untouched - no recapture, same operationId.
   assert.equal(offscreenResponder.sessions.get(tabId).operationId, operationIdBefore, 'capture was not restarted');
@@ -3007,7 +3041,7 @@ test('sync #13: a failed offscreen live propagation does not falsely update the 
 
   const response = await send(MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, { pageKey, gainPercent: 240 }, OPTIONS_TEST_SENDER);
   assert.equal(response.ok, true, 'the storage write itself still succeeds');
-  assert.equal((await settings.getSavedPages())[pageKey], 240);
+  assert.equal((await savedVolumes())[pageKey], 240);
 
   // tabA (confirmed) updated + broadcast; tabB (failed) neither.
   assert.equal(offscreenResponder.sessions.get(tabA).gainPercent, 240);
@@ -3133,7 +3167,7 @@ test('r2fix8: PERSIST_PAGE_VOLUME propagation to a second tab that fails to conf
   });
   assert.equal(response.ok, true); // storage write itself succeeded regardless
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 155);
   assert.equal(offscreenResponder.sessions.get(tabA).gainPercent, 155); // confirmed, propagated
   assert.equal(offscreenResponder.sessions.get(tabB).gainPercent, 100); // NOT silently marked updated
@@ -3298,7 +3332,7 @@ test('r3fix1: an orphaned candidate whose STOP_CAPTURE never resolves fails the 
   // reconcileState()'s own confirmedStopCapture attempt (1500ms) + the
   // emergency sweep's own per-candidate force:true attempt (another
   // 1500ms), both real wall-clock timeouts.
-  await tick(3200);
+  await tick(500);
 
   const response = await responsePromise;
   assert.equal(response.ok, false);
@@ -3738,7 +3772,7 @@ test('r3fix4: a navigation listener does not remain pending forever when the ini
   // then the emergency sweep's own) - a generous margin beyond the 3000ms
   // minimum, since this is a fire-and-forget listener with no direct
   // response promise to await instead.
-  await tick(4200);
+  await tick(500); // two chained offscreen timeouts (60ms each) + a wide margin
 
   assert.equal(closeDocumentCallCount, 1);
 
@@ -3777,7 +3811,7 @@ test('r3fix4: a late initial GET_ACTIVE_SESSIONS response, arriving after its ow
   // generous margin beyond the theoretical minimum, since a real
   // setTimeout-based wait needs headroom under load, not just the exact
   // sum (matches the margin used by other single-chained-timeout tests).
-  await tick(2400);
+  await tick(400);
   releaseGate();
   const response = await responsePromise;
 
@@ -3936,7 +3970,7 @@ test('r4fix1: Reset (SET_TAB_GAIN + PERSIST_PAGE_VOLUME back to 100) works end-t
   assert.equal(resetPersist.ok, true);
 
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 100);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 100);
 });
 
@@ -4136,7 +4170,7 @@ test('r4fix2: a pending candidate whose cancellation STOP_CAPTURE never resolves
   // reconcileState()'s own confirmedStopCapture attempt for the pending
   // candidate (1500ms) + the emergency sweep's own per-candidate force:true
   // attempt (another 1500ms), both real wall-clock timeouts, plus margin.
-  await tick(4200);
+  await tick(500); // two chained offscreen timeouts (60ms each) + a wide margin
 
   const response = await responsePromise;
   assert.equal(response.ok, false);
@@ -4443,7 +4477,7 @@ test('ADD_CURRENT_PAGE completes normally even if navigation happens while its s
     'the page was legitimately being saved at the moment the expectedPageKey check passed - a later navigation does not retroactively invalidate it'
   );
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 130);
   assert.equal(otherPageKey in pages, false);
 });
@@ -4467,7 +4501,7 @@ test('PERSIST_PAGE_VOLUME invalidated by Stop while storage.set is awaiting rest
   const persistResult = await persistPromise;
   assert.equal(persistResult.ok, false);
 
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 100, 'restored to the previous value, never left stale at 170');
 });
 
@@ -4577,7 +4611,7 @@ test('livesync#4: SET_SAVED_PAGE_LIVE_GAIN writes nothing to storage (the saved 
   await enableTab(tabId);
 
   await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: 175 }, OPTIONS_TEST_SENDER);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages[pageKey], 100, 'the stored default stays 100 - a live drag never persists');
 });
 
@@ -4593,11 +4627,11 @@ test('livesync#5: UPDATE_SAVED_PAGE_VOLUME (the change commit) persists exactly 
   for (const value of [150, 180, 240]) {
     await send(MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN, { pageKey, gainPercent: value }, OPTIONS_TEST_SENDER);
   }
-  assert.equal((await settings.getSavedPages())[pageKey], 100, 'still unpersisted while dragging');
+  assert.equal((await savedVolumes())[pageKey], 100, 'still unpersisted while dragging');
 
   const commit = await send(MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME, { pageKey, gainPercent: 240 }, OPTIONS_TEST_SENDER);
   assert.equal(commit.ok, true);
-  assert.equal((await settings.getSavedPages())[pageKey], 240, 'only the final committed value is persisted');
+  assert.equal((await savedVolumes())[pageKey], 240, 'only the final committed value is persisted');
 });
 
 test('livesync#6: SET_SAVED_PAGE_LIVE_GAIN never starts capture on an inactive saved page', async () => {
@@ -4659,7 +4693,7 @@ test('livesync#9: popup SET_TAB_GAIN on an UNSAVED page creates no saved entry (
   const resp = await send(MESSAGE_TYPES.SET_TAB_GAIN, { tabId, gainPercent: 150, expectedOperationId: data.operationId });
   assert.equal(resp.ok, true);
   assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 150, 'the live gain still applied to the temporary session');
-  assert.deepEqual(await settings.getSavedPages(), {}, 'no saved entry was created for the unsaved page');
+  assert.deepEqual(await savedVolumes(), {}, 'no saved entry was created for the unsaved page');
 });
 
 test('livesync#10: a FAILED offscreen live update updates neither the SW cache nor the popup', async () => {
@@ -4753,4 +4787,598 @@ test('livesync#13: wrong sender, wrong target, malformed pageKey, and gain above
   // Gain above 300 (and non-integer) is rejected outright, not clamped.
   assert.equal(validateMessage({ ...base, payload: { pageKey: 'https://x.example/', gainPercent: 350 } }).ok, false, 'gain > 300 rejected');
   assert.equal(validateMessage({ ...base, payload: { pageKey: 'https://x.example/', gainPercent: 150.5 } }).ok, false, 'non-integer gain rejected');
+});
+
+// ===========================================================================
+// v0.2.0: schema-6 saved-page metadata, rename, and the bulk selection
+// operations (Reset selected to 100% / Delete selected), driven end to end
+// through the real registerMessageHandler -> validateMessage -> service-worker
+// path against the fake offscreen responder.
+// ===========================================================================
+
+async function savedRecords() {
+  return settings.getSavedPages();
+}
+
+// --- Title snapshots ---
+
+test('meta #11: Add this page stores the tab title the SERVICE WORKER read, as titleSnapshot', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://titled.example/watch';
+  setTab(tabId, pageKey, 'Real Tab Title');
+
+  const response = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 175 });
+  assert.equal(response.ok, true, JSON.stringify(response));
+
+  const record = (await savedRecords())[pageKey];
+  assert.equal(record.titleSnapshot, 'Real Tab Title');
+  assert.equal(record.volumePercent, 175, "the popup's current slider value is stored as the volume");
+  assert.equal(record.customName, '', 'customName starts empty');
+});
+
+test('meta #12: a popup-supplied title in the payload is IGNORED - only the server-read title is stored', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://spoof.example/page';
+  setTab(tabId, pageKey, 'Genuine Title');
+
+  // A malicious/buggy popup tries to dictate the stored label.
+  const response = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, {
+    tabId,
+    expectedPageKey: pageKey,
+    gainPercent: 100,
+    title: 'ATTACKER SUPPLIED',
+    titleSnapshot: 'ATTACKER SUPPLIED',
+    customName: 'ATTACKER SUPPLIED',
+  });
+  assert.equal(response.ok, true);
+
+  const record = (await savedRecords())[pageKey];
+  assert.equal(record.titleSnapshot, 'Genuine Title', 'the service worker used its own chrome.tabs.get title');
+  assert.equal(record.customName, '', 'a popup-supplied customName is not honoured by Add this page');
+});
+
+test('meta #13: a stored title is sanitized and length-limited', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://messy-title.example/';
+  const nasty = `  Wild\n\tTitle   with \u0007control\u0000 chars  ${'x'.repeat(400)}`;
+  setTab(tabId, pageKey, nasty);
+
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 100 });
+  const record = (await savedRecords())[pageKey];
+  assert.equal(record.titleSnapshot.length <= MAX_TITLE_SNAPSHOT_LENGTH, true, 'length-limited');
+  assert.equal(record.titleSnapshot.includes('\n'), false, 'no raw newlines');
+  assert.equal(record.titleSnapshot.includes('\u0007'), false, 'no control characters');
+  assert.equal(record.titleSnapshot.includes('\u0000'), false, 'no NUL characters');
+  assert.ok(record.titleSnapshot.startsWith('Wild Title with control chars'), record.titleSnapshot);
+});
+
+test('meta #14: Add this page again refreshes the title but keeps an existing customName', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://refresh-title.example/';
+  setTab(tabId, pageKey, 'First Title');
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 120 });
+
+  const renamed = await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: 'My Label' }, OPTIONS_TEST_SENDER);
+  assert.equal(renamed.ok, true);
+
+  setTab(tabId, pageKey, 'Second Title');
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 200 });
+
+  const record = (await savedRecords())[pageKey];
+  assert.equal(record.titleSnapshot, 'Second Title', 'the snapshot refreshed');
+  assert.equal(record.customName, 'My Label', 'the user-chosen name survived');
+  assert.equal(record.volumePercent, 120, 'volume stays idempotent on a re-save');
+});
+
+test('meta: Add this page during a navigation race still returns PAGE_CHANGED and saves neither page', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://race-a.example/';
+  const pageB = 'https://race-b.example/';
+  setTab(tabId, pageA, 'A');
+  setTab(tabId, pageB, 'B'); // the tab already moved on
+
+  const response = await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageA, gainPercent: 150 });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.PAGE_CHANGED);
+  assert.deepEqual(await savedRecords(), {}, 'neither page was saved');
+});
+
+test('meta: Add this page never restarts an already-active temporary session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://active-then-save.example/';
+  setTab(tabId, pageKey, 'Playing');
+  const { data } = await enableTab(tabId, 190);
+
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 190 });
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active', 'still active');
+  assert.equal(state.data.operationId, data.operationId, 'the SAME operation - never restarted');
+  assert.equal(state.data.saved, true);
+});
+
+test('meta #15/#16: a manual add stores customName with an EMPTY titleSnapshot; no name falls back to the URL label', async () => {
+  resetEverything();
+  const named = 'https://manual-named.example/show';
+  const unnamed = 'https://manual-unnamed.example/clip';
+
+  await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: named, gainPercent: 175, customName: '  Movie  Night ' });
+  await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: unnamed, gainPercent: 100 });
+
+  const pages = await savedRecords();
+  assert.deepEqual(pages[named], { volumePercent: 175, titleSnapshot: '', customName: 'Movie Night' });
+  assert.deepEqual(pages[unnamed], { volumePercent: 100, titleSnapshot: '', customName: '' });
+
+  // #17: the display-name priority resolves each one correctly.
+  assert.equal(getDisplayName(named, pages[named]), 'Movie Night');
+  assert.equal(getDisplayName(unnamed, pages[unnamed]), 'manual-unnamed.example · clip', 'local URL fallback');
+});
+
+// --- Rename ---
+
+test('rename #59/#63/#64: rename changes only customName - never the gain, never the session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://rename-live.example/';
+  setTab(tabId, pageKey, 'Snapshot Title');
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 180 });
+  const { data } = await enableTab(tabId, 180);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 180);
+
+  const response = await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: 'Renamed' }, OPTIONS_TEST_SENDER);
+  assert.equal(response.ok, true);
+  assert.equal(response.data.customName, 'Renamed');
+
+  const record = (await savedRecords())[pageKey];
+  assert.equal(record.customName, 'Renamed');
+  assert.equal(record.volumePercent, 180, 'volume untouched');
+  assert.equal(record.titleSnapshot, 'Snapshot Title', 'titleSnapshot untouched');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 180, 'live gain untouched');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active', 'capture neither started nor stopped');
+  assert.equal(state.data.operationId, data.operationId, 'the same operation generation');
+});
+
+test('rename #60/#61: an empty rename clears the override and display falls back to titleSnapshot then the URL', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://fallback-chain.example/clip';
+  setTab(tabId, pageKey, 'Captured Title');
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId, expectedPageKey: pageKey, gainPercent: 100 });
+  await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: 'Override' }, OPTIONS_TEST_SENDER);
+  assert.equal(getDisplayName(pageKey, (await savedRecords())[pageKey]), 'Override');
+
+  await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: '' }, OPTIONS_TEST_SENDER);
+  let record = (await savedRecords())[pageKey];
+  assert.equal(record.customName, '');
+  assert.equal(getDisplayName(pageKey, record), 'Captured Title', 'falls back to the titleSnapshot');
+
+  // With no snapshot either, it falls back to the locally derived URL label.
+  record = { ...record, titleSnapshot: '' };
+  assert.equal(getDisplayName(pageKey, record), 'fallback-chain.example · clip');
+});
+
+test('rename #62: a rename is immediately reflected in local search results', async () => {
+  resetEverything();
+  const pageKey = 'https://opaque-host.example/z9q1';
+  await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: pageKey, gainPercent: 100 });
+  assert.deepEqual(filterSavedPageKeys(await savedRecords(), 'jazz'), [], 'not findable before the rename');
+
+  await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: 'Jazz Radio' }, OPTIONS_TEST_SENDER);
+  assert.deepEqual(filterSavedPageKeys(await savedRecords(), 'jazz'), [pageKey], 'findable straight after the rename');
+});
+
+test('rename #65: renaming a page that is not saved returns a structured error and creates nothing', async () => {
+  resetEverything();
+  const response = await send(
+    MESSAGE_TYPES.RENAME_SAVED_PAGE,
+    { pageKey: 'https://never-saved.example/', customName: 'Nope' },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.PAGE_NOT_SAVED);
+  assert.deepEqual(await savedRecords(), {});
+});
+
+test('rename #66: wrong sender and malformed payloads are rejected', async () => {
+  resetEverything();
+  const pageKey = 'https://rename-guard.example/';
+  await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: pageKey, gainPercent: 100 });
+
+  // RENAME_SAVED_PAGE is options-only.
+  const wrongSender = await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: 'x' }, DEFAULT_TEST_SENDER);
+  assert.equal(wrongSender.ok, false);
+  assert.equal(wrongSender.error.code, ERROR_CODES.INVALID_MESSAGE);
+
+  const { validateMessage } = await import('../shared/validation.js');
+  const base = { target: TARGETS.SERVICE_WORKER, type: MESSAGE_TYPES.RENAME_SAVED_PAGE, requestId: 'r' };
+  assert.equal(validateMessage({ ...base, payload: { pageKey: '', customName: 'x' } }).ok, false, 'empty pageKey');
+  assert.equal(validateMessage({ ...base, payload: { pageKey } }).ok, false, 'missing customName');
+  assert.equal(validateMessage({ ...base, payload: { pageKey, customName: 42 } }).ok, false, 'non-string customName');
+  assert.equal(
+    validateMessage({ ...base, payload: { pageKey, customName: 'x'.repeat(MAX_CUSTOM_NAME_LENGTH + 1) } }).ok,
+    false,
+    'over-long customName is rejected, not silently truncated'
+  );
+  assert.equal(validateMessage({ ...base, payload: { pageKey, customName: '' } }).ok, true, 'an empty name is valid');
+
+  // The record is untouched by every rejected attempt.
+  assert.equal((await savedRecords())[pageKey].customName, '');
+});
+
+// --- Reset selected to 100% ---
+
+test('reset #39: an INACTIVE selected page simply saves 100%', async () => {
+  resetEverything();
+  const pageKey = 'https://reset-inactive.example/';
+  await addAndAssertSaved(pageKey, 250);
+
+  const response = await send(
+    MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
+    { pageKeys: [pageKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.results, [{ pageKey, ok: true }]);
+  assert.equal((await savedVolumes())[pageKey], 100);
+});
+
+test('reset #40/#42: an ACTIVE selected page moves the offscreen gain to 1.0, saves 100%, and STAYS captured', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://reset-active.example/';
+  setTab(tabId, pageKey, 'Loud Page');
+  await addAndAssertSaved(pageKey, 250);
+  const { data } = await enableTab(tabId, 250);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 250);
+
+  const response = await send(
+    MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
+    { pageKeys: [pageKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.results, [{ pageKey, ok: true }]);
+
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 100, 'GainNode gain 1.0');
+  assert.equal((await savedVolumes())[pageKey], 100, 'saved preference is 100%');
+  assert.equal(offscreenResponder.sessions.has(tabId), true, 'capture is still running - this is not a stop');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active');
+  assert.equal(state.data.gainPercent, 100);
+  assert.equal(state.data.operationId, data.operationId, 'the same operation - never restarted');
+});
+
+test('reset #41: both the popup (TAB_STATE_CHANGED) and the Saved-pages row (live gain) receive the 100% update', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://reset-broadcasts.example/';
+  setTab(tabId, pageKey, 'X');
+  await addAndAssertSaved(pageKey, 220);
+  await enableTab(tabId, 220);
+
+  capturedBroadcasts.length = 0;
+  await send(MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100, { pageKeys: [pageKey] }, OPTIONS_TEST_SENDER);
+
+  const popupStates = broadcastsTo(TARGETS.POPUP, MESSAGE_TYPES.TAB_STATE_CHANGED).filter(
+    (b) => b.payload.tabId === tabId && b.payload.gainPercent === 100
+  );
+  assert.ok(popupStates.length >= 1, 'the popup was told the tab is now at 100%');
+
+  const rowUpdates = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGE_LIVE_GAIN_CHANGED).filter(
+    (b) => b.payload.pageKey === pageKey && b.payload.gainPercent === 100
+  );
+  assert.ok(rowUpdates.length >= 1, 'the Saved-pages row was told to move to 100%');
+});
+
+test('reset #43/#44/#45: unselected pages, same-host different-path pages, and unsaved sessions are untouched', async () => {
+  resetEverything();
+  const selectedTab = freshTabId();
+  const siblingTab = freshTabId();
+  const unsavedTab = freshTabId();
+  const selectedKey = 'https://reset-host.example/selected';
+  const siblingKey = 'https://reset-host.example/sibling'; // same host, different exact path
+  const otherKey = 'https://reset-other.example/';
+  const unsavedKey = 'https://reset-unsaved.example/';
+
+  setTab(selectedTab, selectedKey, 'S');
+  setTab(siblingTab, siblingKey, 'B');
+  setTab(unsavedTab, unsavedKey, 'U');
+  await addAndAssertSaved(selectedKey, 250);
+  await addAndAssertSaved(siblingKey, 250);
+  await addAndAssertSaved(otherKey, 250);
+  await enableTab(selectedTab, 250);
+  await enableTab(siblingTab, 250);
+  await enableTab(unsavedTab, 250); // unsaved temporary session
+
+  await send(MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100, { pageKeys: [selectedKey] }, OPTIONS_TEST_SENDER);
+
+  const volumes = await savedVolumes();
+  assert.equal(volumes[selectedKey], 100, 'the selected page reset');
+  assert.equal(volumes[siblingKey], 250, 'the same-host different-path page is untouched');
+  assert.equal(volumes[otherKey], 250, 'an unselected page is untouched');
+  assert.equal(offscreenResponder.sessions.get(selectedTab).gainPercent, 100);
+  assert.equal(offscreenResponder.sessions.get(siblingTab).gainPercent, 250, 'the sibling tab keeps its gain');
+  assert.equal(offscreenResponder.sessions.get(unsavedTab).gainPercent, 250, 'the unsaved session is untouched');
+  assert.equal(unsavedKey in volumes, false, 'no saved record was created for the unsaved page');
+});
+
+test('reset #46/#47/#48: a failed live update does not persist 100% for THAT page and does not block the others', async () => {
+  resetEverything();
+  const failingTab = freshTabId();
+  const okTab = freshTabId();
+  const failingKey = 'https://reset-fails.example/';
+  const okKey = 'https://reset-succeeds.example/';
+  setTab(failingTab, failingKey, 'F');
+  setTab(okTab, okKey, 'O');
+  await addAndAssertSaved(failingKey, 250);
+  await addAndAssertSaved(okKey, 250);
+  await enableTab(failingTab, 250);
+  await enableTab(okTab, 250);
+
+  // The offscreen live update fails for the FAILING tab only.
+  offscreenResponder.setSetTabGainOverride((payload) => {
+    if (payload.tabId === failingTab) {
+      return { ok: false, error: { code: ERROR_CODES.NOT_ACTIVE, message: 'simulated' } };
+    }
+    const session = offscreenResponder.sessions.get(payload.tabId);
+    if (!session || session.operationId !== payload.operationId) {
+      return { ok: false, error: { code: ERROR_CODES.NOT_ACTIVE, message: 'No active session for this tab.' } };
+    }
+    session.gainPercent = payload.gainPercent;
+    return { ok: true, data: { tabId: payload.tabId, gainPercent: payload.gainPercent } };
+  });
+
+  const response = await send(
+    MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
+    { pageKeys: [failingKey, okKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true, 'the batch itself resolves - per-page results carry the detail');
+
+  const results = response.data.results;
+  const failing = results.find((r) => r.pageKey === failingKey);
+  const succeeding = results.find((r) => r.pageKey === okKey);
+  assert.equal(failing.ok, false, 'the failing page is reported as failed, never as success');
+  assert.ok(failing.error.code, 'a structured error code is reported');
+  assert.equal(succeeding.ok, true, 'the unrelated page still succeeded');
+
+  const volumes = await savedVolumes();
+  assert.equal(volumes[failingKey], 250, '100% was NOT persisted for the page whose live update failed');
+  assert.equal(volumes[okKey], 100, 'the independent page committed normally');
+
+  offscreenResponder.setSetTabGainOverride(null);
+});
+
+// --- Delete selected ---
+
+test('delete #49/#53/#55: selected inactive pages are deleted; unselected and different exact URLs are untouched', async () => {
+  resetEverything();
+  const deleteKey = 'https://del-host.example/gone';
+  const siblingKey = 'https://del-host.example/stays'; // same host, different exact path
+  const otherKey = 'https://del-other.example/';
+  await addAndAssertSaved(deleteKey, 150);
+  await addAndAssertSaved(siblingKey, 150);
+  await addAndAssertSaved(otherKey, 150);
+
+  const response = await send(
+    MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES,
+    { pageKeys: [deleteKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.results, [{ pageKey: deleteKey, ok: true }]);
+
+  const volumes = await savedVolumes();
+  assert.equal(deleteKey in volumes, false, 'the selected page is gone');
+  assert.equal(volumes[siblingKey], 150, 'the same-host different-path page survives');
+  assert.equal(volumes[otherKey], 150, 'the unselected page survives');
+});
+
+test('delete #50: a selected ACTIVE page is stopped through confirmed teardown before its record is removed', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://del-active.example/';
+  setTab(tabId, pageKey, 'A');
+  await addAndAssertSaved(pageKey, 150);
+  await enableTab(tabId, 150);
+  assert.equal(offscreenResponder.sessions.has(tabId), true);
+
+  const response = await send(MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES, { pageKeys: [pageKey] }, OPTIONS_TEST_SENDER);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.results, [{ pageKey, ok: true }]);
+
+  assert.equal(offscreenResponder.sessions.has(tabId), false, 'the live session was stopped');
+  assert.equal(pageKey in (await savedVolumes()), false, 'the record was removed');
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.notEqual(state.data.state, 'active', 'boosting did not silently restart');
+  assert.equal(state.data.saved, false, 'the popup now sees an unsaved page');
+});
+
+test('delete #51/#52/#57: a failed teardown PRESERVES that record and never blocks an unrelated deletion', async () => {
+  resetEverything();
+  const stubbornTab = freshTabId();
+  const stubbornKey = 'https://del-stubborn.example/';
+  const easyKey = 'https://del-easy.example/';
+  setTab(stubbornTab, stubbornKey, 'S');
+  await addAndAssertSaved(stubbornKey, 150);
+  await addAndAssertSaved(easyKey, 150);
+  await enableTab(stubbornTab, 150);
+
+  // STOP_CAPTURE for the stubborn tab can never be confirmed.
+  offscreenResponder.setStopCaptureOverride((payload) => {
+    if (payload.tabId === stubbornTab) {
+      return { ok: false, error: { code: ERROR_CODES.INTERNAL_ERROR, message: 'simulated stop failure' } };
+    }
+    return offscreenResponder.defaultStopCapture(payload);
+  });
+
+  const response = await send(
+    MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES,
+    { pageKeys: [stubbornKey, easyKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+
+  const results = response.data.results;
+  const stubborn = results.find((r) => r.pageKey === stubbornKey);
+  const easy = results.find((r) => r.pageKey === easyKey);
+  assert.equal(stubborn.ok, false, 'the unconfirmed teardown is reported as a failure');
+  assert.ok(stubborn.error.code);
+  assert.equal(easy.ok, true, 'the unrelated page was still deleted');
+
+  const volumes = await savedVolumes();
+  assert.equal(volumes[stubbornKey], 150, 'the saved record was NOT deleted while its session might still be live');
+  assert.equal(easyKey in volumes, false, 'the independent page was deleted');
+
+  offscreenResponder.setStopCaptureOverride(null);
+});
+
+test('delete: an UNSAVED active session on another tab is never disturbed by a bulk delete', async () => {
+  resetEverything();
+  const savedTab = freshTabId();
+  const unsavedTab = freshTabId();
+  const savedKey = 'https://del-saved.example/';
+  const unsavedKey = 'https://del-untouched.example/';
+  setTab(savedTab, savedKey, 'S');
+  setTab(unsavedTab, unsavedKey, 'U');
+  await addAndAssertSaved(savedKey, 150);
+  await enableTab(savedTab, 150);
+  await enableTab(unsavedTab, 150);
+
+  await send(MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES, { pageKeys: [savedKey] }, OPTIONS_TEST_SENDER);
+
+  assert.equal(offscreenResponder.sessions.has(savedTab), false, 'the selected saved page stopped');
+  assert.equal(offscreenResponder.sessions.has(unsavedTab), true, 'the unrelated unsaved session kept running');
+});
+
+test('delete #58: the individual row Delete uses the same safe core - an unconfirmed teardown keeps the record', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://del-single-safe.example/';
+  setTab(tabId, pageKey, 'S');
+  await addAndAssertSaved(pageKey, 150);
+  await enableTab(tabId, 150);
+
+  offscreenResponder.setStopCaptureOverride(() => ({
+    ok: false,
+    error: { code: ERROR_CODES.INTERNAL_ERROR, message: 'simulated stop failure' },
+  }));
+
+  const response = await send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey }, OPTIONS_TEST_SENDER);
+  assert.equal(response.ok, false, 'the single delete reports the same structured failure');
+  assert.equal((await savedVolumes())[pageKey], 150, 'the record survives, exactly like the bulk path');
+
+  offscreenResponder.setStopCaptureOverride(null);
+});
+
+test('delete: a successful individual row Delete removes the record and stops its session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://del-single-ok.example/';
+  setTab(tabId, pageKey, 'S');
+  await addAndAssertSaved(pageKey, 150);
+  await enableTab(tabId, 150);
+
+  const response = await send(MESSAGE_TYPES.REMOVE_SAVED_PAGE, { pageKey }, OPTIONS_TEST_SENDER);
+  assert.equal(response.ok, true);
+  assert.equal(offscreenResponder.sessions.has(tabId), false);
+  assert.equal(pageKey in (await savedVolumes()), false);
+});
+
+// --- Bulk payload validation + sender matrix ---
+
+test('bulk: pageKeys payloads are strictly validated (array, non-empty, canonical, no duplicates, bounded)', async () => {
+  const { validateMessage } = await import('../shared/validation.js');
+  const good = 'https://bulk-ok.example/';
+  for (const type of [MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100, MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES]) {
+    const base = { target: TARGETS.SERVICE_WORKER, type, requestId: 'r' };
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: [good] } }).ok, true, `${type} accepts a valid list`);
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: [] } }).ok, false, 'empty array rejected');
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: good } }).ok, false, 'non-array rejected');
+    assert.equal(validateMessage({ ...base, payload: {} }).ok, false, 'missing pageKeys rejected');
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: [good, good] } }).ok, false, 'duplicates rejected');
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: [''] } }).ok, false, 'empty key rejected');
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: ['not a URL'] } }).ok, false, 'non-canonical key rejected');
+    assert.equal(
+      validateMessage({ ...base, payload: { pageKeys: ['https://chromewebstore.google.com/detail/x'] } }).ok,
+      false,
+      'restricted key rejected'
+    );
+    assert.equal(
+      validateMessage({ ...base, payload: { pageKeys: ['https://user:pass@x.example/'] } }).ok,
+      false,
+      'credentialed key rejected'
+    );
+    assert.equal(
+      validateMessage({ ...base, payload: { pageKeys: ['https://EXAMPLE.com/'] } }).ok,
+      false,
+      'a non-canonical form is rejected rather than silently canonicalized'
+    );
+    const oversized = Array.from({ length: MAX_BULK_PAGE_KEYS + 1 }, (_, i) => `https://bulk.example/${i}`);
+    assert.equal(validateMessage({ ...base, payload: { pageKeys: oversized } }).ok, false, 'oversized batch rejected');
+  }
+});
+
+test('bulk: both bulk messages are options-only - the popup sender is rejected', async () => {
+  resetEverything();
+  const pageKey = 'https://bulk-sender.example/';
+  await addAndAssertSaved(pageKey, 150);
+
+  for (const type of [MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100, MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES]) {
+    const response = await send(type, { pageKeys: [pageKey] }, DEFAULT_TEST_SENDER);
+    assert.equal(response.ok, false, `${type} must reject the popup sender`);
+    assert.equal(response.error.code, ERROR_CODES.INVALID_MESSAGE);
+  }
+  assert.equal((await savedVolumes())[pageKey], 150, 'nothing was changed by the rejected attempts');
+});
+
+test('bulk: a bulk operation naming a page that is not saved reports it per-page without touching the others', async () => {
+  resetEverything();
+  const realKey = 'https://bulk-real.example/';
+  const ghostKey = 'https://bulk-ghost.example/';
+  await addAndAssertSaved(realKey, 250);
+
+  const response = await send(
+    MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
+    { pageKeys: [ghostKey, realKey] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  const ghost = response.data.results.find((r) => r.pageKey === ghostKey);
+  const real = response.data.results.find((r) => r.pageKey === realKey);
+  assert.equal(ghost.ok, false);
+  assert.equal(ghost.error.code, ERROR_CODES.PAGE_NOT_SAVED);
+  assert.equal(real.ok, true);
+  assert.equal((await savedVolumes())[realKey], 100);
+});
+
+test('GET_SAVED_PAGES returns schema-6 records plus the currently active exact pageKeys', async () => {
+  resetEverything();
+  const activeTab = freshTabId();
+  const activeKey = 'https://gsp-active.example/';
+  const idleKey = 'https://gsp-idle.example/';
+  setTab(activeTab, activeKey, 'Active Page');
+  await send(MESSAGE_TYPES.ADD_CURRENT_PAGE, { tabId: activeTab, expectedPageKey: activeKey, gainPercent: 175 });
+  await addAndAssertSaved(idleKey, 120);
+  await enableTab(activeTab, 175);
+
+  const response = await send(MESSAGE_TYPES.GET_SAVED_PAGES, {}, OPTIONS_TEST_SENDER);
+  assert.equal(response.ok, true);
+  assert.deepEqual(response.data.savedPages[activeKey], {
+    volumePercent: 175,
+    titleSnapshot: 'Active Page',
+    customName: '',
+  });
+  assert.deepEqual(response.data.activePageKeys, [activeKey], 'only the genuinely active exact page is listed');
+  assert.equal(response.data.savedPages[idleKey].volumePercent, 120);
 });

@@ -215,6 +215,112 @@ for (const icon of ['icon16.png', 'icon32.png', 'icon48.png', 'icon128.png']) {
   }
 }
 
+// 14. Schema 6 -----------------------------------------------------------------------
+// The saved-page storage model must be schema 6, and its runtime record shape
+// must carry exactly the three documented fields.
+const constantsContent = runtimeContents.get('shared/constants.js') ?? '';
+if (!/export const SCHEMA_VERSION\s*=\s*6\b/.test(constantsContent)) {
+  fail('schema-version', 'shared/constants.js must declare SCHEMA_VERSION = 6');
+}
+const metadataContent = runtimeContents.get('shared/saved-page-metadata.js') ?? '';
+if (!metadataContent) {
+  fail('missing-metadata-module', 'shared/saved-page-metadata.js is required for the schema-6 record shape');
+}
+for (const field of ['volumePercent', 'titleSnapshot', 'customName']) {
+  if (!metadataContent.includes(field)) {
+    fail('saved-page-record-shape', `shared/saved-page-metadata.js does not define the "${field}" record field`);
+  }
+}
+
+/**
+ * Strips block and line comments so a token check tests actual CODE, not prose.
+ * The doc comments in this project deliberately NAME the things they promise
+ * never to do ("never loads a favicon", "never calls chrome.storage.local
+ * directly"), so scanning raw text would flag exactly the files that document
+ * the guarantee best.
+ */
+function stripJsComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .map((line) => {
+      const index = line.indexOf('//');
+      return index === -1 ? line : line.slice(0, index);
+    })
+    .join('\n');
+}
+const runtimeJsCode = runtimeJsEntries.map(([file, content]) => [file, stripJsComments(content)]);
+
+// 15. No remote title / favicon / metadata lookup -------------------------------------
+// The display name for a saved page is derived ONLY from locally stored text.
+// Nothing may reach out for a title, a favicon, or any page metadata.
+const REMOTE_METADATA_TOKENS = [
+  'favicon',
+  'chrome://favicon',
+  '_favicon',
+  'opengraph',
+  'og:title',
+  'oembed',
+  'jsonp',
+  'importScripts(',
+];
+for (const [file, content] of runtimeJsCode) {
+  for (const token of REMOTE_METADATA_TOKENS) {
+    if (content.toLowerCase().includes(token.toLowerCase())) {
+      fail('remote-metadata-lookup', `${file} references "${token}" - saved-page labels must be derived locally`);
+    }
+  }
+}
+
+// 16. Storage-write containment, including remove() ------------------------------------
+// Only shared/settings.js may mutate chrome.storage.local at all - the popup
+// and options page must never write or delete storage directly.
+for (const [file, content] of runtimeJsCode) {
+  if (/chrome\.storage\.local\.remove\(/.test(content) && file !== 'shared/settings.js') {
+    fail('storage-remove-outside-settings', `${file} calls chrome.storage.local.remove directly`);
+  }
+  if (file.startsWith('options/') || file.startsWith('popup/')) {
+    if (/chrome\.storage\b/.test(content)) {
+      fail('ui-storage-access', `${file} touches chrome.storage directly - every write must go through the service worker`);
+    }
+  }
+}
+
+// 17. Selection / search state is never persisted ---------------------------------------
+// Selection and the search query are temporary view state. Neither may appear
+// as a storage key, nor in the persisted saved-page record shape.
+const settingsContent = runtimeContents.get('shared/settings.js') ?? '';
+const PERSISTENCE_FORBIDDEN_STATE = ['selection', 'selectedPageKeys', 'searchQuery', 'searchTerm'];
+for (const token of PERSISTENCE_FORBIDDEN_STATE) {
+  if (settingsContent.includes(token)) {
+    fail('persisted-view-state', `shared/settings.js references "${token}" - selection/search state must never be persisted`);
+  }
+  if (constantsContent.includes(`${token}:`)) {
+    fail('persisted-view-state', `shared/constants.js declares a storage key for "${token}"`);
+  }
+}
+
+// 18. Every new message type has target-specific validation + a sender rule --------------
+// A message type that the service worker handles must appear both in
+// shared/validation.js (a payload validator keyed by target) and in
+// service-worker.js's explicit allowed-sender matrix.
+const validationContent = runtimeContents.get('shared/validation.js') ?? '';
+const SW_HANDLED_MESSAGE_TYPES = [
+  'RENAME_SAVED_PAGE',
+  'RESET_SELECTED_SAVED_PAGES_TO_100',
+  'DELETE_SELECTED_SAVED_PAGES',
+  'SET_SAVED_PAGE_LIVE_GAIN',
+  'UPDATE_SAVED_PAGE_VOLUME',
+];
+for (const type of SW_HANDLED_MESSAGE_TYPES) {
+  if (!validationContent.includes(`MESSAGE_TYPES.${type}`)) {
+    fail('missing-payload-validator', `shared/validation.js has no target-keyed payload validator for ${type}`);
+  }
+  if (!new RegExp(`OPTIONS_ONLY_MESSAGE_TYPES[\\s\\S]*MESSAGE_TYPES\\.${type}`).test(swContent)) {
+    fail('missing-sender-rule', `service-worker.js does not list ${type} in its allowed-sender matrix`);
+  }
+}
+
 // ---------------------------------------------------------------------------------
 console.log(`Scanned ${runtimeFiles.length} runtime files (manifest.json, service-worker.js, offscreen/, popup/, options/, shared/).`);
 console.log('tests/, README.md, SECURITY.md, and LICENSE are intentionally excluded from pattern scanning.\n');

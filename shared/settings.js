@@ -9,8 +9,15 @@
 // savedPages membership as a precondition for starting a temporary
 // capture session. See README.md/SECURITY.md for the full product model.
 
-import { STORAGE_KEYS, SCHEMA_VERSION, LEGACY_SCHEMA_VERSION_WITH_ALLOWED_PAGES, DEFAULT_VOLUME_PERCENT } from './constants.js';
+import {
+  STORAGE_KEYS,
+  SCHEMA_VERSION,
+  LEGACY_SCHEMA_VERSION_WITH_ALLOWED_PAGES,
+  LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES,
+  DEFAULT_VOLUME_PERCENT,
+} from './constants.js';
 import { normalizeSavedPages } from './validation.js';
+import { createSavedPageRecord, sanitizeTitleSnapshot, sanitizeCustomName } from './saved-page-metadata.js';
 
 // A minimal, zero-dependency in-process promise chain that serializes every
 // storage mutation relative to every other one, within the current
@@ -74,17 +81,25 @@ async function removeLegacyAllowedPagesIfPresent() {
 }
 
 /**
- * Migrates a schema-4 install (an `allowedPages` map at the legacy storage
- * key) into schema-5's `savedPages` map, preserving every valid canonical
- * exact pageKey and its valid percentage (normalizeSavedPages drops anything
- * malformed/uncanonical - see its own doc comment). The new schema is
- * written FIRST; only after that write succeeds is the legacy key removed.
- * If the schema-5 write throws, the legacy key is left intact so a later
- * caller retries the migration from scratch rather than losing the data.
+ * Migrates a legacy install into schema 6, preserving every valid canonical
+ * exact pageKey and its valid percentage. `sourceKey` is where the legacy map
+ * lives:
+ *   - schema 4: the `allowedPages` key, values are numbers;
+ *   - schema 5: the current `savedPages` key, values are numbers.
+ * Both are folded through the one normalizeSavedPages implementation, which
+ * turns a bare number into a full schema-6 record `{volumePercent,
+ * titleSnapshot: '', customName: ''}` and drops anything malformed or
+ * uncanonical (see its doc comment, and normalizeSavedPageRecord's).
+ *
+ * The new schema is written FIRST, in a single set() carrying both the new
+ * settings version and the migrated map; only after that write succeeds is the
+ * legacy allowedPages key removed. If the write throws, nothing is deleted and
+ * schemaInitPromise is cleared, so a later caller retries the migration from
+ * the still-intact original data rather than losing it.
  */
-async function migrateSchema4ToSchema5() {
-  const legacyAllowedPages = await readRaw(STORAGE_KEYS.LEGACY_ALLOWED_PAGES, {});
-  const migrated = normalizeSavedPages(legacyAllowedPages);
+async function migrateLegacyToSchema6(sourceKey) {
+  const legacyMap = await readRaw(sourceKey, {});
+  const migrated = normalizeSavedPages(legacyMap);
   await chrome.storage.local.set({
     [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
     [STORAGE_KEYS.SAVED_PAGES]: migrated,
@@ -98,17 +113,26 @@ function ensureSchemaInitialized() {
       const settings = await readRaw(STORAGE_KEYS.SETTINGS, null);
       if (settings && settings.schemaVersion === SCHEMA_VERSION) {
         // Already current - but a stray legacy key may still linger (e.g. a
-        // prior migration that wrote schema-5 but crashed before cleanup).
+        // prior migration that wrote schema-6 but crashed before cleanup).
         // Remove it if present; never re-write settings/savedPages.
         await removeLegacyAllowedPagesIfPresent();
         return;
       }
+      if (settings && settings.schemaVersion === LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES) {
+        // Schema 5 -> 6: the savedPages key already holds canonical exact
+        // URLs, but each value is a bare number. Every valid volume is
+        // preserved; titleSnapshot/customName start empty.
+        await migrateLegacyToSchema6(STORAGE_KEYS.SAVED_PAGES);
+        return;
+      }
       if (settings && settings.schemaVersion === LEGACY_SCHEMA_VERSION_WITH_ALLOWED_PAGES) {
-        await migrateSchema4ToSchema5();
+        // Schema 4 -> 6, straight through: the legacy allowedPages map is
+        // numeric exactly like schema 5's, so it needs no intermediate hop.
+        await migrateLegacyToSchema6(STORAGE_KEYS.LEGACY_ALLOWED_PAGES);
         return;
       }
       // No recognized prior schema (fresh install, or anything else
-      // unrecognized/malformed) - reset to empty schema-5 defaults, exactly
+      // unrecognized/malformed) - reset to empty schema-6 defaults, exactly
       // like the pre-migration behavior did for any non-matching version,
       // and drop any stray legacy key alongside it.
       await chrome.storage.local.set({
@@ -147,19 +171,88 @@ export async function getSavedPages() {
 }
 
 /**
- * Idempotent: saving an already-saved page preserves its existing volume
- * rather than overwriting it with `volumePercent` - this is what makes a
- * concurrent duplicate save (e.g. two Add-URL-manually submissions for the
- * identical URL) never clobber a value someone else already committed.
+ * Adds (or refreshes the metadata of) one saved page.
+ *
+ * Volume is idempotent exactly as before: saving an already-saved page
+ * preserves its existing volume rather than overwriting it with
+ * `volumePercent`, which is what makes a concurrent duplicate save (e.g. two
+ * Add-URL-manually submissions for the identical URL) never clobber a value
+ * someone else already committed.
+ *
+ * Metadata follows schema-6's ownership rules, and is the reason this can
+ * write even when the page already exists:
+ *  - `titleSnapshot` is refreshed whenever the caller supplies a non-empty one
+ *    ("Add this page" re-reads the live tab title). A manual add never supplies
+ *    one, so an existing snapshot is preserved.
+ *  - `customName` is applied only when the caller supplies a non-empty one, so
+ *    an existing user-chosen name always survives a re-save. It is never
+ *    cleared here - clearing is exclusively RENAME_SAVED_PAGE's job.
+ * The read-modify-write runs inside the shared serialized mutation queue and
+ * re-reads authoritative storage first, so it can never resurrect a stale
+ * snapshot over a concurrent rename/volume update/delete.
  */
-export function addSavedPage(pageKey, volumePercent) {
+export function addSavedPage(pageKey, volumePercent, metadata = {}) {
   return enqueueMutation(async () => {
     const pages = await readSavedPages();
-    if (!(pageKey in pages)) {
-      pages[pageKey] = volumePercent;
+    const existing = pages[pageKey];
+    const incomingTitle = sanitizeTitleSnapshot(metadata.titleSnapshot);
+    const incomingName = sanitizeCustomName(metadata.customName);
+
+    const nextVolume = existing ? existing.volumePercent : volumePercent;
+    const nextTitle = incomingTitle || (existing ? existing.titleSnapshot : '');
+    const nextName = incomingName || (existing ? existing.customName : '');
+
+    const record = createSavedPageRecord({
+      volumePercent: nextVolume,
+      titleSnapshot: nextTitle,
+      customName: nextName,
+    });
+    if (record === null) {
+      return { pageKey, volumePercent: existing ? existing.volumePercent : null, aborted: true, code: 'INVALID_VOLUME' };
+    }
+
+    const unchanged =
+      existing &&
+      existing.volumePercent === record.volumePercent &&
+      existing.titleSnapshot === record.titleSnapshot &&
+      existing.customName === record.customName;
+    if (!unchanged) {
+      pages[pageKey] = record;
       await writeSavedPages(pages);
     }
-    return { pageKey, volumePercent: pages[pageKey] };
+    return { pageKey, volumePercent: record.volumePercent, titleSnapshot: record.titleSnapshot, customName: record.customName };
+  });
+}
+
+/**
+ * Sets one saved page's local `customName` override, and nothing else.
+ * `pageKey`, `volumePercent`, and `titleSnapshot` are all carried through
+ * untouched, so a rename can never move a page, change its audio, or discard
+ * its captured title. An empty (or whitespace-only) name clears the override,
+ * after which the display name falls back to titleSnapshot, then to a locally
+ * derived URL label.
+ *
+ * Never creates a missing entry: renaming a page that was deleted (or cleared)
+ * in the meantime is a structured no-op, not a resurrection.
+ */
+export function renameSavedPage(pageKey, customName) {
+  return enqueueMutation(async () => {
+    const pages = await readSavedPages();
+    const existing = pages[pageKey];
+    if (!existing) {
+      return { aborted: true, code: 'PAGE_NOT_SAVED', pageKey };
+    }
+    const nextName = sanitizeCustomName(customName);
+    if (existing.customName === nextName) {
+      return { aborted: false, pageKey, customName: nextName };
+    }
+    pages[pageKey] = {
+      volumePercent: existing.volumePercent,
+      titleSnapshot: existing.titleSnapshot,
+      customName: nextName,
+    };
+    await writeSavedPages(pages);
+    return { aborted: false, pageKey, customName: nextName };
   });
 }
 
@@ -237,8 +330,13 @@ export function persistExistingVolumeIfPreconditionHolds(pageKey, volumePercent,
     if (!precondition()) {
       return { aborted: true, code: 'PRECONDITION_FAILED' };
     }
-    const previousVolumePercent = pages[pageKey];
-    pages[pageKey] = volumePercent;
+    // Record-level update: ONLY volumePercent changes. titleSnapshot and
+    // customName are carried through from the authoritative record just read,
+    // so a volume commit can never discard a concurrent rename's name or a
+    // captured title.
+    const previousRecord = pages[pageKey];
+    const previousVolumePercent = previousRecord.volumePercent;
+    pages[pageKey] = { ...previousRecord, volumePercent };
     await writeSavedPages(pages);
     // The precondition can ALSO become false while this very write was in
     // flight (e.g. a real, paused chrome.storage.local.set call) - nothing
@@ -248,7 +346,7 @@ export function persistExistingVolumeIfPreconditionHolds(pageKey, volumePercent,
     // restoring the previous value directly (no re-read needed) is safe
     // and stays inside this same queue turn.
     if (!precondition()) {
-      pages[pageKey] = previousVolumePercent;
+      pages[pageKey] = { ...previousRecord, volumePercent: previousVolumePercent };
       await writeSavedPages(pages);
       return { aborted: true, code: 'PRECONDITION_FAILED' };
     }

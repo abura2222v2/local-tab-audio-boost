@@ -69,15 +69,56 @@ Stored, in `chrome.storage.local` only:
 
 ```jsonc
 // "settings"
-{ "schemaVersion": 5 }
+{ "schemaVersion": 6 }
 
 // "savedPages"
-{ "https://film.example/watch/movie-123": 150 }
+{
+  "https://film.example/watch/movie-123": {
+    "volumePercent": 150,
+    "titleSnapshot": "Movie 123 - Film Example",
+    "customName": ""
+  }
+}
 ```
 
 That's the entire persisted state: a schema version number, and a map of
-exact page URLs to a preferred volume percentage. Nothing else is ever
-written to persistent storage.
+exact page URLs to a small record. Nothing else is ever written to persistent
+storage.
+
+The three record fields, and where each one comes from:
+
+- **`volumePercent`** - an integer from 0 to 300. The only field that affects
+  audio.
+- **`titleSnapshot`** - a **local** snapshot of the tab's own title, read by
+  the service worker via `chrome.tabs.get` at the moment you press **Add this
+  page**, and nowhere else. A title supplied by the popup in the message
+  payload is deliberately ignored, so a compromised or buggy popup cannot write
+  an arbitrary label into storage. It is sanitized before storage (control
+  characters stripped, whitespace collapsed, length-limited) and is never
+  refreshed in the background. A **manually added** URL is never loaded, so it
+  never gets a title snapshot at all.
+- **`customName`** - an optional label you typed yourself, via the **Add URL
+  manually** name field or a row's **Rename**. Sanitized and length-limited the
+  same way. Setting it empty clears it.
+
+Both metadata fields are **display labels only**. Neither affects exact-page
+matching, neither affects audio, and neither is ever fetched: there is no title
+service, no favicon request, no Open Graph or oEmbed lookup, and no metadata API
+anywhere in this extension. When a page has neither label, its display name is
+derived locally from the URL's own text (see `shared/saved-page-metadata.js`).
+
+**Never persisted:** the Saved-pages **search query** and the **row selection**
+are temporary state inside the open options page. They are never written to
+storage, never included in a saved-page record, and disappear when the view
+closes. Live capture-session state (operation IDs, which tabs are boosting) is
+likewise in-memory only.
+
+Schema-5 profiles (where each `savedPages` value was a bare number) migrate
+automatically into schema-6 records the first time this version runs: every
+valid canonical exact URL and its valid volume is preserved, and both metadata
+fields start empty. As with the schema-4 migration below, the new data is
+written before anything old is removed, and a failed write leaves the original
+data untouched so the migration can be retried rather than losing it.
 
 **A saved page is a stored preference, never a capture permission.**
 Boosting any supported current http/https page requires only an explicit
@@ -88,10 +129,10 @@ is written anywhere; it never starts, stops, or is a precondition for a
 capture session. A prior version of this extension (schema 4) called this
 map `allowedPages` and required a page to be present in it before capture
 could start at all - that requirement no longer exists. Schema 4 installs
-are migrated automatically and losslessly into `savedPages` the first time
+are migrated automatically and losslessly into schema-6 `savedPages` the first time
 this version runs (see `shared/settings.js`); the migration preserves every
 valid canonical exact URL and its valid percentage, and never itself grants
-or implies any capture permission, present or past. Once the schema-5 write
+or implies any capture permission, present or past. Once the schema-6 write
 succeeds, the old `allowedPages` key is deleted from `chrome.storage.local`
 so no stale copy of your exact URLs lingers; if that write fails the legacy
 key is left intact so the migration can retry rather than lose data.

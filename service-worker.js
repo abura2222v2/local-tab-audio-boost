@@ -27,6 +27,7 @@ import {
   validatePageContextSender,
 } from './shared/messages.js';
 import { clampGainPercent, isPlainObject, isNonEmptyString, isValidTabId } from './shared/validation.js';
+import { sanitizeTitleSnapshot, sanitizeCustomName } from './shared/saved-page-metadata.js';
 import { canonicalizePageKey } from './shared/urls.js';
 import * as settingsStore from './shared/settings.js';
 
@@ -64,6 +65,14 @@ let offscreenCreationPromise = null;
 // ---------------------------------------------------------------------------
 
 const TIMEOUT_SENTINEL = Symbol('offscreen-response-timeout');
+
+/**
+ * The live offscreen-response timeout. Always OFFSCREEN_RESPONSE_TIMEOUT_MS in
+ * the real extension; tests override it (via __setOffscreenResponseTimeoutForTests)
+ * so a timeout-path test can assert the real behavior deterministically off a
+ * short, controlled timeout instead of sleeping for multiple real seconds.
+ */
+let offscreenResponseTimeoutMs = OFFSCREEN_RESPONSE_TIMEOUT_MS;
 
 function withTimeout(promise, ms) {
   let timer;
@@ -185,7 +194,7 @@ async function confirmedStopCapture(tabId, { operationId, force = false, reason 
   const requestedOperationId = operationId ?? null;
   const response = await withTimeout(
     sendMessage(TARGETS.OFFSCREEN, MESSAGE_TYPES.STOP_CAPTURE, { tabId, operationId, force, reason }),
-    OFFSCREEN_RESPONSE_TIMEOUT_MS
+    offscreenResponseTimeoutMs
   );
   const timedOut = response === TIMEOUT_SENTINEL;
   const validShape =
@@ -324,7 +333,7 @@ async function reconcileState() {
   // simply never awaited again.
   const activeSessionsResponse = await withTimeout(
     sendMessage(TARGETS.OFFSCREEN, MESSAGE_TYPES.GET_ACTIVE_SESSIONS, {}),
-    OFFSCREEN_RESPONSE_TIMEOUT_MS
+    offscreenResponseTimeoutMs
   );
   if (
     activeSessionsResponse === TIMEOUT_SENTINEL ||
@@ -488,7 +497,7 @@ async function emergencyFailClosed() {
   try {
     const response = await withTimeout(
       sendMessage(TARGETS.OFFSCREEN, MESSAGE_TYPES.GET_ACTIVE_SESSIONS, {}),
-      OFFSCREEN_RESPONSE_TIMEOUT_MS
+      offscreenResponseTimeoutMs
     );
 
     if (
@@ -595,6 +604,14 @@ function describeUrlErrorCode(code) {
   }
 }
 
+/**
+ * Resolves a tab's canonical exact pageKey, and alongside it the tab's CURRENT
+ * title as read from chrome.tabs.get here in the service worker. The title is
+ * read server-side on purpose: "Add this page" never trusts a title supplied by
+ * the popup (see handleAddCurrentPage), so a compromised or buggy popup cannot
+ * write an arbitrary label into storage. The raw title is passed on to
+ * sanitizeTitleSnapshot before it is ever stored.
+ */
 async function resolvePageKeyForTab(tabId) {
   let tab;
   try {
@@ -609,7 +626,7 @@ async function resolvePageKeyForTab(tabId) {
   if (!result.ok) {
     return { ok: false, error: { code: result.code, message: describeUrlErrorCode(result.code) } };
   }
-  return { ok: true, pageKey: result.pageKey };
+  return { ok: true, pageKey: result.pageKey, title: typeof tab.title === 'string' ? tab.title : '' };
 }
 
 /**
@@ -655,11 +672,14 @@ async function computeTabStateData(tabId) {
     };
   }
   const savedPages = await settingsStore.getSavedPages();
-  const saved = resolved.pageKey in savedPages;
+  const savedRecord = savedPages[resolved.pageKey];
+  const saved = Boolean(savedRecord);
   const matchesEntry = Boolean(entry) && entry.pageKey === resolved.pageKey;
   const state = matchesEntry ? entry.state : 'inactive';
+  // Schema 6: a saved page's stored value is a record, so the inactive
+  // display volume comes from its volumePercent field.
   const gainPercent =
-    state === 'active' && entry ? entry.gainPercent : (savedPages[resolved.pageKey] ?? DEFAULT_VOLUME_PERCENT);
+    state === 'active' && entry ? entry.gainPercent : (savedRecord ? savedRecord.volumePercent : DEFAULT_VOLUME_PERCENT);
   return {
     tabId,
     pageKey: resolved.pageKey,
@@ -687,7 +707,10 @@ async function broadcastTabState(tabId, extra = {}) {
 async function broadcastSavedPagesChanged() {
   try {
     const savedPages = await settingsStore.getSavedPages();
-    await sendMessage(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED, { savedPages });
+    await sendMessage(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED, {
+      savedPages,
+      activePageKeys: listActivePageKeys(),
+    });
   } catch {
     // Best-effort only - the saved-pages view may not be open.
   }
@@ -830,7 +853,7 @@ async function beginCaptureForPage(tabId, pageKey, operationId, initialGainPerce
         pageKey,
         gainPercent,
       }),
-      OFFSCREEN_RESPONSE_TIMEOUT_MS
+      offscreenResponseTimeoutMs
     );
 
     const timedOut = startResponse === TIMEOUT_SENTINEL;
@@ -894,27 +917,41 @@ async function beginCaptureForPage(tabId, pageKey, operationId, initialGainPerce
  * for it, so an open popup on that exact active tab immediately shows the
  * new percentage - and a failed propagation never falsely updates either.
  */
+/**
+ * Applies one confirmed, operation-scoped live gain to ONE active session, and
+ * updates the local cache + notifies observers only on positive confirmation.
+ * The single primitive behind every live-gain path (popup slider, saved-pages
+ * row drag, and bulk Reset-to-100), so they can never diverge on what counts
+ * as "the offscreen document actually applied this".
+ *
+ * Returns true only if the offscreen document echoed back this exact
+ * tabId/gain AND the operation was still current afterwards. A failed, stale,
+ * or superseded update returns false and changes nothing - never a cache entry
+ * claiming a gain that was not applied, and never a broadcast implying one.
+ */
+async function applyConfirmedGainToSession(tabId, operationId, clamped) {
+  const gainResponse = await sendMessage(TARGETS.OFFSCREEN, MESSAGE_TYPES.SET_TAB_GAIN, {
+    tabId,
+    gainPercent: clamped,
+    operationId,
+  });
+  const gainConfirmed =
+    Boolean(gainResponse) &&
+    gainResponse.ok === true &&
+    gainResponse.data?.tabId === tabId &&
+    gainResponse.data?.gainPercent === clamped;
+  if (!gainConfirmed) return false;
+  const current = sessions.get(tabId);
+  if (!current || current.operationId !== operationId) return false;
+  current.gainPercent = clamped;
+  await broadcastTabState(tabId);
+  return true;
+}
+
 async function propagateGainToSessionsSharingPageKey(pageKey, clamped) {
   for (const [otherTabId, otherEntry] of sessions) {
     if (otherEntry.pageKey === pageKey && otherEntry.state === 'active') {
-      const otherOperationId = otherEntry.operationId;
-      const gainResponse = await sendMessage(TARGETS.OFFSCREEN, MESSAGE_TYPES.SET_TAB_GAIN, {
-        tabId: otherTabId,
-        gainPercent: clamped,
-        operationId: otherOperationId,
-      });
-      const gainConfirmed =
-        Boolean(gainResponse) &&
-        gainResponse.ok === true &&
-        gainResponse.data?.tabId === otherTabId &&
-        gainResponse.data?.gainPercent === clamped;
-      if (gainConfirmed) {
-        const currentOther = sessions.get(otherTabId);
-        if (currentOther && currentOther.operationId === otherOperationId) {
-          currentOther.gainPercent = clamped;
-          await broadcastTabState(otherTabId);
-        }
-      }
+      await applyConfirmedGainToSession(otherTabId, otherEntry.operationId, clamped);
     }
   }
 }
@@ -929,10 +966,24 @@ async function handleGetTabState({ tabId }) {
   return { ok: true, data };
 }
 
+/**
+ * The exact pageKeys that currently have an ACTIVE session, so the saved-pages
+ * view can show a per-row boosting status. Derived purely from the live
+ * in-memory session cache - session state is never persisted, and this list is
+ * never stored.
+ */
+function listActivePageKeys() {
+  const keys = new Set();
+  for (const entry of sessions.values()) {
+    if (entry.state === 'active' && entry.pageKey) keys.add(entry.pageKey);
+  }
+  return [...keys];
+}
+
 async function handleGetSavedPages() {
   await ensureReconciled();
   const savedPages = await settingsStore.getSavedPages();
-  return { ok: true, data: { savedPages } };
+  return { ok: true, data: { savedPages, activePageKeys: listActivePageKeys() } };
 }
 
 /**
@@ -957,19 +1008,39 @@ async function handleAddCurrentPage({ tabId, expectedPageKey, gainPercent }) {
     return { ok: false, error: { code: ERROR_CODES.PAGE_CHANGED, message: 'This page changed before the action could complete.' } };
   }
   const clamped = clampGainPercent(gainPercent) ?? DEFAULT_VOLUME_PERCENT;
-  const result = await settingsStore.addSavedPage(resolved.pageKey, clamped);
+  // Schema 6: the titleSnapshot is the tab's CURRENT title, read by this
+  // service worker from chrome.tabs.get above - never a value the popup sent,
+  // and never fetched from the network. It is sanitized (control characters
+  // stripped, whitespace collapsed, length-limited) before storage.
+  // customName is deliberately not supplied here, so an existing user-chosen
+  // name survives a re-save untouched (see addSavedPage). Saving never starts,
+  // stops, or restarts a capture session.
+  const result = await settingsStore.addSavedPage(resolved.pageKey, clamped, {
+    titleSnapshot: sanitizeTitleSnapshot(resolved.title),
+  });
   broadcastSavedPagesChanged();
   broadcastTabState(tabId);
   return { ok: true, data: result };
 }
 
-async function handleAddPageManual({ rawUrl, gainPercent }) {
+/**
+ * A manually entered URL is NEVER visited, fetched, or captured, so it can
+ * have no titleSnapshot - only the optional local name the user typed. An
+ * empty name leaves the display falling back to a locally derived URL label.
+ * Re-adding an already-saved URL never duplicates it: the existing record's
+ * titleSnapshot is preserved, and an existing customName is only replaced when
+ * the user actually supplied a new one.
+ */
+async function handleAddPageManual({ rawUrl, gainPercent, customName }) {
   await ensureReconciled();
   const result = canonicalizePageKey(rawUrl);
   if (!result.ok) return { ok: false, error: { code: result.code, message: describeUrlErrorCode(result.code) } };
   const clamped = gainPercent === undefined ? DEFAULT_VOLUME_PERCENT : (clampGainPercent(gainPercent) ?? DEFAULT_VOLUME_PERCENT);
-  const added = await settingsStore.addSavedPage(result.pageKey, clamped);
+  const added = await settingsStore.addSavedPage(result.pageKey, clamped, {
+    customName: sanitizeCustomName(customName),
+  });
   broadcastSavedPagesChanged();
+  broadcastSavedPageChangedToPopup(result.pageKey);
   return { ok: true, data: added };
 }
 
@@ -1001,13 +1072,146 @@ async function stopSnapshotSessions(predicate, reason) {
  * structured failure is returned - the storage mutation never runs, and
  * SAVED_PAGES_CHANGED is never broadcast.
  */
+/**
+ * The single safe per-page deletion core, shared by the individual row Delete
+ * (REMOVE_SAVED_PAGE) and by bulk Delete selected (DELETE_SELECTED_SAVED_PAGES),
+ * so both obey exactly the same contract:
+ *
+ *  1. snapshot every active session whose immutable pageKey EXACTLY matches;
+ *  2. stop each through confirmed, operation-scoped teardown;
+ *  3. only if every required teardown was positively confirmed, remove the
+ *     saved record. An unconfirmed teardown leaves the record fully intact and
+ *     reports a structured failure - the preference is never deleted while an
+ *     offscreen graph for it might still be live.
+ *
+ * An UNSAVED session is never touched (it has no saved record to remove and
+ * does not match any pageKey being deleted unless it genuinely is that exact
+ * page), and no other exact URL - same hostname or not - is affected.
+ */
+async function deleteOneSavedPage(pageKey) {
+  const stopResult = await stopSnapshotSessions(
+    (entry) => entry.pageKey === pageKey,
+    SESSION_STOP_REASONS.REMOVED_FROM_SAVED_PAGES
+  );
+  if (!stopResult.ok) {
+    return { pageKey, ok: false, error: stopResult.error };
+  }
+  const result = await settingsStore.removeSavedPage(pageKey);
+  return { pageKey, ok: true, removed: result.removed };
+}
+
 async function handleRemoveSavedPage({ pageKey }) {
   await ensureReconciled();
-  const stopResult = await stopSnapshotSessions((entry) => entry.pageKey === pageKey, SESSION_STOP_REASONS.REMOVED_FROM_SAVED_PAGES);
-  if (!stopResult.ok) return stopResult;
-  const result = await settingsStore.removeSavedPage(pageKey);
+  const result = await deleteOneSavedPage(pageKey);
+  if (!result.ok) return { ok: false, error: result.error };
   broadcastSavedPagesChanged();
-  return { ok: true, data: result };
+  broadcastSavedPageChangedToPopup(pageKey);
+  return { ok: true, data: { pageKey, removed: result.removed } };
+}
+
+/**
+ * Bulk delete over the saved-pages view's current selection. Every page is an
+ * INDEPENDENT result: one page whose teardown cannot be confirmed keeps its
+ * saved record and reports a structured failure, while unrelated selected
+ * pages still complete normally. Never reports success for a page that failed -
+ * the caller folds the per-page results back into its selection, dropping the
+ * successes and keeping the failures selected for a retry.
+ */
+async function handleDeleteSelectedSavedPages({ pageKeys }) {
+  await ensureReconciled();
+  const results = [];
+  let anyDeleted = false;
+  for (const pageKey of pageKeys) {
+    const result = await deleteOneSavedPage(pageKey);
+    if (result.ok) anyDeleted = true;
+    results.push(result.ok ? { pageKey, ok: true } : { pageKey, ok: false, error: result.error });
+  }
+  if (anyDeleted) {
+    broadcastSavedPagesChanged();
+    for (const result of results) {
+      if (result.ok) broadcastSavedPageChangedToPopup(result.pageKey);
+    }
+  }
+  return { ok: true, data: { results } };
+}
+
+/**
+ * Resets ONE selected page's saved volume to 100% (GainNode gain 1.0). This is
+ * not a deletion and never stops capture: a page that is currently boosting
+ * stays boosting, just at 1.0.
+ *
+ * For an ACTIVE saved page every matching snapshot session must positively
+ * confirm the operation-scoped 100% live update BEFORE the saved preference is
+ * committed - if any confirmation fails, 100% is not persisted for that page
+ * and a structured failure is returned. An inactive page simply persists.
+ */
+async function resetOneSavedPageTo100(pageKey) {
+  const snapshot = [...sessions.entries()].filter(
+    ([, entry]) => entry.pageKey === pageKey && entry.state === 'active'
+  );
+
+  for (const [tabId, entry] of snapshot) {
+    const confirmed = await applyConfirmedGainToSession(tabId, entry.operationId, DEFAULT_VOLUME_PERCENT);
+    if (!confirmed) {
+      return {
+        pageKey,
+        ok: false,
+        error: { code: ERROR_CODES.CAPTURE_FAILED, message: 'Could not apply 100% to this page’s active tab.' },
+      };
+    }
+    // The row in any open Saved-pages view follows the confirmed live change.
+    broadcastSavedPageLiveGainToOptions(pageKey, DEFAULT_VOLUME_PERCENT);
+  }
+
+  const result = await settingsStore.persistExistingVolumeIfPreconditionHolds(
+    pageKey,
+    DEFAULT_VOLUME_PERCENT,
+    () => true
+  );
+  if (result.aborted) {
+    return { pageKey, ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
+  }
+  return { pageKey, ok: true };
+}
+
+/**
+ * Bulk "Reset selected to 100%". Independent per-page results exactly like
+ * bulk delete: a failure for one page never blocks another, and a page whose
+ * live update could not be confirmed does not get 100% persisted.
+ */
+async function handleResetSelectedSavedPagesTo100({ pageKeys }) {
+  await ensureReconciled();
+  const results = [];
+  let anyChanged = false;
+  for (const pageKey of pageKeys) {
+    const result = await resetOneSavedPageTo100(pageKey);
+    if (result.ok) anyChanged = true;
+    results.push(result);
+  }
+  if (anyChanged) {
+    broadcastSavedPagesChanged();
+    for (const result of results) {
+      if (result.ok) broadcastSavedPageChangedToPopup(result.pageKey);
+    }
+  }
+  return { ok: true, data: { results } };
+}
+
+/**
+ * Sets one saved page's local customName. Display-only: pageKey,
+ * volumePercent, and titleSnapshot are all untouched, and no capture session is
+ * started, stopped, or otherwise disturbed. An empty name clears the override.
+ * Renaming a page that no longer exists returns a structured PAGE_NOT_SAVED
+ * rather than resurrecting it.
+ */
+async function handleRenameSavedPage({ pageKey, customName }) {
+  await ensureReconciled();
+  const result = await settingsStore.renameSavedPage(pageKey, customName);
+  if (result.aborted) {
+    return { ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
+  }
+  broadcastSavedPagesChanged();
+  return { ok: true, data: { pageKey, customName: result.customName } };
 }
 
 /**
@@ -1327,6 +1531,12 @@ async function handleMessage(message) {
       return handleUpdateSavedPageVolume(message.payload);
     case MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN:
       return handleSavedPageLiveGain(message.payload);
+    case MESSAGE_TYPES.RENAME_SAVED_PAGE:
+      return handleRenameSavedPage(message.payload);
+    case MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100:
+      return handleResetSelectedSavedPagesTo100(message.payload);
+    case MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES:
+      return handleDeleteSelectedSavedPages(message.payload);
     case MESSAGE_TYPES.START_CAPTURE:
       return handleStartCapture(message.payload);
     case MESSAGE_TYPES.STOP_CAPTURE:
@@ -1368,6 +1578,9 @@ const OPTIONS_ONLY_MESSAGE_TYPES = new Set([
   MESSAGE_TYPES.CLEAR_SAVED_PAGES,
   MESSAGE_TYPES.UPDATE_SAVED_PAGE_VOLUME,
   MESSAGE_TYPES.SET_SAVED_PAGE_LIVE_GAIN,
+  MESSAGE_TYPES.RENAME_SAVED_PAGE,
+  MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
+  MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES,
 ]);
 const OFFSCREEN_ONLY_MESSAGE_TYPES = new Set([MESSAGE_TYPES.SESSION_STOPPED, MESSAGE_TYPES.SESSION_ERROR]);
 
@@ -1509,4 +1722,14 @@ export function __resetForTests() {
   reconciliationPromise = null;
   reconciliationComplete = false;
   offscreenCreationPromise = null;
+  offscreenResponseTimeoutMs = OFFSCREEN_RESPONSE_TIMEOUT_MS;
+}
+
+/**
+ * Test-only: shortens (or restores) the offscreen-response timeout so a
+ * timeout-path test runs deterministically off a controlled value instead of
+ * a multi-second real-wall-clock sleep. Never called by any extension context.
+ */
+export function __setOffscreenResponseTimeoutForTests(ms) {
+  offscreenResponseTimeoutMs = typeof ms === 'number' && ms > 0 ? ms : OFFSCREEN_RESPONSE_TIMEOUT_MS;
 }

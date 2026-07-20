@@ -126,9 +126,9 @@ test('source: options.css has an effective [hidden] rule with display:none and !
   assert.equal(contradicts, false, 'no [hidden] rule sets a visible display');
 });
 
-test('source: the !important is genuinely required - .options__clear-confirm sets display:flex for the visible state', () => {
+test('source: the !important is genuinely required - .options__confirm sets display:flex for the visible state', () => {
   const css = stripCssComments(read('options/options.css'));
-  const block = (css.match(/\.options__clear-confirm\s*\{[^}]*\}/) || [''])[0];
+  const block = (css.match(/\.options__confirm\s*\{[^}]*\}/) || [''])[0];
   assert.match(block, /display\s*:\s*flex/i, 'the visible confirmation uses display:flex, so hide must use !important');
 });
 
@@ -150,6 +150,6 @@ test('source: options.js never auto-shows the confirmation at startup', () => {
 test('source: options.js wires Cancel, Escape, and confirm to the controller', () => {
   const js = read('options/options.js');
   assert.match(js, /clearConfirmCancel\.addEventListener\(\s*'click'\s*,\s*\(\)\s*=>\s*clearConfirm\.hide\(\)/, 'Cancel -> hide');
-  assert.match(js, /key\s*===\s*'Escape'\s*\)\s*clearConfirm\.onEscape\(\)/, 'Escape -> onEscape');
+  assert.match(js, /'Escape'[\s\S]{0,80}clearConfirm\.onEscape\(\)/, 'Escape -> onEscape');
   assert.match(js, /clearConfirm\.confirm\(\)/, 'Yes -> confirm');
 });

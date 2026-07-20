@@ -12,11 +12,18 @@ explicit user action** - moving the main slider, or clicking **Enable
 boosting**. You never need to save a page first.
 
 **Saving a page is optional, and is not a capture permission.** Saving only
-stores two things for one **exact web page URL** - not a website, not a
+stores a few things for one **exact web page URL** - not a website, not a
 domain, not "everything on this hostname":
 
 - the exact canonical URL;
-- your preferred volume percentage for that exact URL.
+- your preferred volume percentage for that exact URL;
+- a **title snapshot**, captured locally from the open tab at the moment you
+  press **Add this page** (a manually added URL never gets one, because that
+  page is never loaded);
+- an optional **custom name** you typed yourself.
+
+The last two are display labels only. They never affect matching, never affect
+audio, and are never fetched from anywhere - see **Privacy** below.
 
 For example, saving
 
@@ -89,12 +96,25 @@ The popup has one main volume slider (0-300%) and four controls:
   starting volume, default 100%) without visiting or capturing it at all.
 - **Enable boosting** / **Disable boosting** is a single toggle that starts
   or stops a session on the current tab - saved or not.
-- **Saved pages** opens the saved-pages view, where you can see every saved
-  page, adjust its saved volume with its own slider, delete individual
-  entries, or clear the whole list (with a confirmation step). Changing a
-  row's slider there updates only that exact URL's saved value, and live-
-  updates any tab(s) currently boosting that identical URL - it never starts
-  a new session on its own.
+- **Saved pages** opens the saved-pages management view, where you can:
+  - **search** your saved pages locally (by name, captured title, hostname,
+    URL, path, query, or fragment - multi-word queries match in any order);
+  - adjust each page's saved volume with its own slider, which live-updates
+    any tab currently boosting that identical exact URL and never starts a new
+    session on its own;
+  - **rename** any page (a local label only - the URL, volume, captured title,
+    and any running session are all untouched; clearing the name falls back to
+    the captured title, then to a label derived from the URL);
+  - **select** pages with checkboxes and then **Reset selected to 100%** (keeps
+    every record, keeps capture running, just returns the gain to 1.0) or
+    **Delete selected** (stops each page's sessions first, then removes only
+    those exact URLs);
+  - delete individual entries, or clear the whole list (with a confirmation
+    step, in a separate danger section).
+
+  Selection and the search text live only in the open view - neither is ever
+  saved to disk. Bulk actions report per-page results, so a page that fails is
+  never counted as a success and stays selected so you can retry it.
 - Two tabs showing the **identical** exact URL that are both currently
   boosting share one live propagation target: committing a change in either
   one (from the popup or the saved-pages view) updates the other too.
@@ -124,6 +144,18 @@ for the exact code-level detail of how that's enforced.
 - **Fully local.** No analytics, no telemetry, no advertisements, no update
   checker beyond Chrome's own extension system, and no network request of any
   kind, anywhere in the code.
+- **Titles and names are local, and never fetched.** A page's title snapshot is
+  read from the tab you already have open, only when you press **Add this
+  page**, and only by the service worker (a title supplied by the popup is
+  ignored). A manually added URL is never visited, so it gets no title at all -
+  just the optional name you type. When a page has neither, its label is derived
+  from the URL's own text. There is no title service, no favicon request, no
+  Open Graph lookup, and no metadata API anywhere in this extension.
+- **Search is entirely local**, running over data already in
+  `chrome.storage.local`. Nothing you type into the search box leaves your
+  machine, and the query is never stored.
+- **Selection is temporary.** Which rows you have checked in the Saved pages
+  view exists only while that view is open - it is never written to storage.
 - **Exact page URLs can be sensitive** - they may contain access tokens,
   session identifiers, search queries, or other private information. This
   extension never sends a URL anywhere; it only ever exists in
@@ -167,7 +199,11 @@ node --test
 runs the unit test suite (`tests/urls.test.js`, `tests/validation.test.js`,
 `tests/storage-logic.test.js`, `tests/service-worker-logic.test.js`,
 `tests/offscreen-contract.test.js`, `tests/sender-validation.test.js`,
-`tests/popup-gain-controller.test.js`) - no install step, no dependencies.
+`tests/popup-gain-controller.test.js`, `tests/popup-controller.test.js`,
+`tests/popup-modal.test.js`, `tests/saved-page-slider.test.js`,
+`tests/options-clear-confirm.test.js`, `tests/saved-page-metadata.test.js`,
+`tests/saved-pages-search.test.js`, `tests/saved-pages-view-model.test.js`) -
+no install step, no dependencies.
 
 ```
 node scripts/audit.mjs
@@ -220,6 +256,47 @@ automatically for you.
   deletes its `chrome.storage.local` data along with it.
 
 ## Changelog
+
+### 0.2.0
+
+Saved pages becomes a real management view. Everything below is **fully local** -
+no page is ever fetched, and no title, favicon, or metadata is ever looked up
+online.
+
+- **Local smart search.** A search box filters saved pages by custom name,
+  captured title, generated label, hostname, full URL (raw and percent-decoded),
+  path, query string, and fragment. Multi-word queries use *tokenized AND* -
+  `rezka kandidat` matches a page whose hostname supplies one word and whose
+  path supplies the other, in any order. Search only decides which rows are
+  visible; it never widens audio matching beyond the exact page.
+- **Checkboxes and bulk actions.** Every row has a checkbox, plus **Select all
+  visible**, **Clear selection**, **Reset selected to 100%**, and **Delete
+  selected**. Selection is temporary view state and is never stored. It survives
+  a search change, so the counts always report totals, visible, and *hidden by
+  search* - and the delete confirmation states the hidden count explicitly.
+- **Reset selected to 100%** keeps every record and keeps capture running; it
+  just returns the volume to 1.0 gain. **Delete selected** stops each page's
+  matching sessions through the existing confirmed teardown *before* removing
+  its record. Both report **per-page** results: one page failing never blocks
+  another, a failed page is never reported as succeeded, and failed pages stay
+  selected so you can retry.
+- **Automatic title snapshots.** **Add this page** now stores the current tab's
+  title, read by the service worker itself (a title supplied by the popup is
+  ignored) and sanitized before storage. Re-saving refreshes the snapshot but
+  keeps any name you chose.
+- **Names.** **Add URL manually** gained an optional name field, and every row
+  has **Rename**. A rename changes only the name - never the URL, the volume,
+  the captured title, or any capture session. Clearing the name falls back to
+  the captured title, then to a label derived locally from the URL itself
+  (`https://www.youtube.com/watch?v=abc` → `youtube.com · watch`).
+- **Storage schema 6.** Each saved page is now a record -
+  `{volumePercent, titleSnapshot, customName}` - instead of a bare number.
+  Existing schema-5 (and schema-4) profiles migrate automatically: every valid
+  exact URL and volume is preserved, metadata starts empty, and the old data is
+  never deleted until the new write succeeds.
+- Live popup ↔ Saved pages slider synchronization, exact-page matching, the
+  0-300% range, temporary boosting on unsaved pages, and every lifecycle
+  guarantee are unchanged.
 
 ### 0.1.3
 

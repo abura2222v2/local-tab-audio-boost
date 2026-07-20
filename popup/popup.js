@@ -18,6 +18,7 @@ const els = {
   manualAddOverlay: document.getElementById('manual-add-overlay'),
   manualModalPanel: document.querySelector('#manual-add-overlay .popup__modal'),
   manualUrlInput: document.getElementById('manual-url-input'),
+  manualNameInput: document.getElementById('manual-name-input'),
   manualVolumeInput: document.getElementById('manual-volume-input'),
   manualVolumeDisplay: document.getElementById('manual-volume-display'),
   manualAddError: document.getElementById('manual-add-error'),
@@ -191,6 +192,7 @@ const manualModal = createManualAddModalController({
   modal: els.manualAddOverlay,
   resetFields: () => {
     els.manualUrlInput.value = '';
+    els.manualNameInput.value = '';
     els.manualVolumeInput.value = '100';
     els.manualVolumeDisplay.textContent = '100%';
     els.manualAddError.textContent = ''; // reopening always clears stale error text
@@ -202,12 +204,15 @@ const manualModal = createManualAddModalController({
       els.manualAddError.textContent = 'Enter a URL.';
       return { ok: false };
     }
-    // Saving never opens the page, never captures a tab, and never grants a
-    // domain-wide permission - it is a storage-only write, validated and
-    // performed exclusively by the service worker.
+    // Saving never opens the page, never captures a tab, never fetches its
+    // title, and never grants a domain-wide permission - it is a storage-only
+    // write, validated and performed exclusively by the service worker. The
+    // optional name is a purely local label; a manually added URL gets no
+    // titleSnapshot, because the page is never loaded.
     const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.ADD_PAGE_MANUAL, {
       rawUrl,
       gainPercent: Number(els.manualVolumeInput.value),
+      customName: els.manualNameInput.value,
     });
     if (!response.ok) {
       els.manualAddError.textContent = response.error?.message ?? 'That URL could not be added.';

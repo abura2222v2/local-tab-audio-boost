@@ -111,14 +111,47 @@ test('validateMessage rejects a non-object message', () => {
   assert.equal(validateMessage('hello').ok, false);
 });
 
+/**
+ * Schema 6: every surviving value is a record. A bare number (schema 5) is
+ * migrated in place to a record with empty metadata.
+ */
+const rec = (volumePercent, titleSnapshot = '', customName = '') => ({ volumePercent, titleSnapshot, customName });
+
 test('normalizeSavedPages recovers malformed storage safely', () => {
   assert.deepEqual(normalizeSavedPages(null), {});
   assert.deepEqual(normalizeSavedPages(undefined), {});
   assert.deepEqual(normalizeSavedPages([1, 2, 3]), {});
   assert.deepEqual(
     normalizeSavedPages({ 'https://a.example/': 100, 'https://b.example/': 999, bad: 'x', '': 50 }),
-    { 'https://a.example/': 100 }
+    { 'https://a.example/': rec(100) }
   );
+});
+
+test('schema6: a schema-5 bare number migrates to a full record with empty metadata', () => {
+  assert.deepEqual(normalizeSavedPages({ 'https://a.example/': 209 }), { 'https://a.example/': rec(209) });
+});
+
+test('schema6: an existing valid record survives normalization intact', () => {
+  const input = { 'https://a.example/': { volumePercent: 175, titleSnapshot: 'My title', customName: 'Nick' } };
+  assert.deepEqual(normalizeSavedPages(input), { 'https://a.example/': rec(175, 'My title', 'Nick') });
+});
+
+test('schema6: unrecognized record properties are dropped, never trusted', () => {
+  const input = {
+    'https://a.example/': { volumePercent: 150, titleSnapshot: 'T', customName: 'C', evil: 'x', schemaVersion: 99 },
+  };
+  const result = normalizeSavedPages(input);
+  assert.deepEqual(Object.keys(result['https://a.example/']).sort(), ['customName', 'titleSnapshot', 'volumePercent']);
+});
+
+test('schema6: invalid metadata types normalize to empty strings; an invalid volume drops the record', () => {
+  const result = normalizeSavedPages({
+    'https://ok.example/': { volumePercent: 120, titleSnapshot: 42, customName: { nope: true } },
+    'https://bad-volume.example/': { volumePercent: 999, titleSnapshot: 'x', customName: '' },
+    'https://non-integer.example/': { volumePercent: 120.5, titleSnapshot: '', customName: '' },
+    'https://not-an-object.example/': 'nope',
+  });
+  assert.deepEqual(result, { 'https://ok.example/': rec(120) });
 });
 
 // ===========================================================================
@@ -148,7 +181,7 @@ test('r5-6: an unsupported-scheme key is dropped', () => {
 });
 
 test('r5-6: a valid exact URL and percentage survive unchanged', () => {
-  assert.deepEqual(normalizeSavedPages({ 'https://a.example/path?q=1#f': 175 }), { 'https://a.example/path?q=1#f': 175 });
+  assert.deepEqual(normalizeSavedPages({ 'https://a.example/path?q=1#f': 175 }), { 'https://a.example/path?q=1#f': rec(175) });
 });
 
 test('r5-6: equivalent default-port / hostname-case forms normalize deterministically onto one canonical key', () => {
@@ -156,7 +189,7 @@ test('r5-6: equivalent default-port / hostname-case forms normalize deterministi
   // Both canonicalize to https://example.com/ ; exactly one key survives, and
   // the first one encountered (the :443 form) deterministically wins.
   assert.deepEqual(Object.keys(result), ['https://example.com/']);
-  assert.equal(result['https://example.com/'], 120);
+  assert.equal(result['https://example.com/'].volumePercent, 120);
 });
 
 test('r5-6: distinct path / query / fragment forms remain separate keys', () => {
@@ -167,10 +200,10 @@ test('r5-6: distinct path / query / fragment forms remain separate keys', () => 
     'https://a.example/one#frag': 130,
   });
   assert.deepEqual(result, {
-    'https://a.example/one': 100,
-    'https://a.example/two': 110,
-    'https://a.example/one?x=1': 120,
-    'https://a.example/one#frag': 130,
+    'https://a.example/one': rec(100),
+    'https://a.example/two': rec(110),
+    'https://a.example/one?x=1': rec(120),
+    'https://a.example/one#frag': rec(130),
   });
 });
 

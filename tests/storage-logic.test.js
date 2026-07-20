@@ -9,7 +9,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as settings from '../shared/settings.js';
-import { STORAGE_KEYS, SCHEMA_VERSION, LEGACY_SCHEMA_VERSION_WITH_ALLOWED_PAGES, DEFAULT_VOLUME_PERCENT } from '../shared/constants.js';
+import {
+  STORAGE_KEYS,
+  SCHEMA_VERSION,
+  LEGACY_SCHEMA_VERSION_WITH_ALLOWED_PAGES,
+  LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES,
+  DEFAULT_VOLUME_PERCENT,
+} from '../shared/constants.js';
+
+/**
+ * Schema 6 stores each saved page as a record ({volumePercent, titleSnapshot,
+ * customName}). Most assertions in this file only care about the VOLUME, so
+ * this projects the authoritative record map down to the {pageKey: percent}
+ * shape those assertions were written against. Tests that specifically care
+ * about metadata call settings.getSavedPages() directly and assert on the
+ * record fields.
+ */
+async function savedVolumes() {
+  const pages = await settings.getSavedPages();
+  return Object.fromEntries(Object.entries(pages).map(([key, record]) => [key, record.volumePercent]));
+}
+
 
 function installChromeStub(initial = {}) {
   let store = { ...initial };
@@ -164,7 +184,7 @@ test('two concurrent additions of different pages both survive', async () => {
     settings.addSavedPage('https://a.example/', DEFAULT_VOLUME_PERCENT),
     settings.addSavedPage('https://b.example/', DEFAULT_VOLUME_PERCENT),
   ]);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, {
     'https://a.example/': DEFAULT_VOLUME_PERCENT,
     'https://b.example/': DEFAULT_VOLUME_PERCENT,
@@ -180,7 +200,7 @@ test('an addition and a removal racing on different pages never clobber one anot
     settings.addSavedPage('https://new.example/', DEFAULT_VOLUME_PERCENT),
     settings.removeSavedPage('https://existing.example/'),
   ]);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, { 'https://new.example/': DEFAULT_VOLUME_PERCENT });
 });
 
@@ -191,7 +211,7 @@ test('persist and clear are serialized relative to each other, never producing a
     settings.persistExistingVolumeIfPreconditionHolds('https://x.example/', 150, () => true),
     settings.clearSavedPages(),
   ]);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   const isFullyCleared = Object.keys(pages).length === 0;
   const isPersistedThenNotCleared = pages['https://x.example/'] === 150;
   assert.ok(isFullyCleared || isPersistedThenNotCleared);
@@ -202,7 +222,7 @@ test('duplicate save is idempotent and preserves the already-saved volume', asyn
   await settings.addSavedPage('https://y.example/', DEFAULT_VOLUME_PERCENT);
   await settings.persistExistingVolumeIfPreconditionHolds('https://y.example/', 175, () => true);
   await settings.addSavedPage('https://y.example/', DEFAULT_VOLUME_PERCENT);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://y.example/'], 175);
 });
 
@@ -220,7 +240,7 @@ test('duplicate persist is idempotent', async () => {
   await settings.addSavedPage('https://w.example/', DEFAULT_VOLUME_PERCENT);
   await settings.persistExistingVolumeIfPreconditionHolds('https://w.example/', 120, () => true);
   await settings.persistExistingVolumeIfPreconditionHolds('https://w.example/', 120, () => true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://w.example/'], 120);
 });
 
@@ -228,14 +248,14 @@ test('clearing an already-empty list is a successful no-op', async () => {
   installChromeStub();
   const result = await settings.clearSavedPages();
   assert.deepEqual(result, {});
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('addSavedPage saves a caller-supplied initial volume for a genuinely new page (e.g. the Add-URL-manually modal)', async () => {
   installChromeStub();
   const result = await settings.addSavedPage('https://manual.example/', 65);
   assert.equal(result.volumePercent, 65);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://manual.example/'], 65);
 });
 
@@ -245,7 +265,7 @@ test('addSavedPage adopts (preserves) a volume saved concurrently by another add
     settings.addSavedPage('https://race-save.example/', 150),
     settings.addSavedPage('https://race-save.example/', 30),
   ]);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   // Whichever call actually won the race, the loser must adopt that exact
   // value rather than silently overwriting it - so the final value must be
   // one of the two candidates, never some other value.
@@ -268,7 +288,7 @@ test('r5-5: a schema-4 install migrates every valid entry into savedPages and re
       'https://legacy-b.example/': 40,
     },
   });
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, {
     'https://legacy-a.example/': 150,
     'https://legacy-b.example/': 40,
@@ -291,7 +311,7 @@ test('r5-5: migration drops malformed/uncanonical legacy entries safely, keeping
       '': 50,
     },
   });
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, { 'https://legacy-valid.example/': 120 });
 });
 
@@ -340,7 +360,7 @@ test('r5-5: a failed schema-5 write during migration leaves the legacy allowedPa
 
   // A later caller retries from scratch: this time the write succeeds, the
   // data migrates, and only now is the legacy key removed.
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, { 'https://retry-me.example/': 175 });
   assert.equal(removeCalled, true);
   assert.equal(STORAGE_KEYS.LEGACY_ALLOWED_PAGES in store, false);
@@ -352,7 +372,7 @@ test('r5-5: an already-current schema-5 profile with a leftover legacy allowedPa
     [STORAGE_KEYS.SAVED_PAGES]: { 'https://kept.example/': 133 },
     [STORAGE_KEYS.LEGACY_ALLOWED_PAGES]: { 'https://leftover.example/': 90 },
   });
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, { 'https://kept.example/': 133 });
   assert.equal(STORAGE_KEYS.LEGACY_ALLOWED_PAGES in getStore(), false, 'stray legacy key cleaned up');
   assert.deepEqual(getStore.removedKeys, [STORAGE_KEYS.LEGACY_ALLOWED_PAGES]);
@@ -365,7 +385,7 @@ test('r5-5: Clear all leaves neither savedPages entries nor a legacy allowedPage
     [STORAGE_KEYS.LEGACY_ALLOWED_PAGES]: { 'https://ghost.example/': 120 },
   });
   await settings.clearSavedPages();
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
   assert.equal(STORAGE_KEYS.LEGACY_ALLOWED_PAGES in getStore(), false);
 });
 
@@ -373,7 +393,7 @@ test('a completely empty store (fresh install, no legacy schema-4 data) resets t
   installChromeStub();
   const readSettings = await settings.getSettings();
   assert.equal(readSettings.schemaVersion, SCHEMA_VERSION);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('an unrecognized/malformed stored schemaVersion (neither current nor the one defined legacy version) resets to empty schema-5 defaults', async () => {
@@ -381,7 +401,7 @@ test('an unrecognized/malformed stored schemaVersion (neither current nor the on
     [STORAGE_KEYS.SETTINGS]: { schemaVersion: 1 },
     [STORAGE_KEYS.SAVED_PAGES]: { 'https://stale.example/': 100 },
   });
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, {});
   const readSettings = await settings.getSettings();
   assert.equal(readSettings.schemaVersion, SCHEMA_VERSION);
@@ -392,7 +412,7 @@ test('an already-current schema-5 install (no stray legacy key) is left complete
     [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
     [STORAGE_KEYS.SAVED_PAGES]: { 'https://current.example/': 133 },
   });
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, { 'https://current.example/': 133 });
   assert.deepEqual(getStore.removedKeys, [], 'no legacy key present -> remove is never called');
 });
@@ -404,7 +424,7 @@ test('persistExistingVolumeIfPreconditionHolds on a missing key does not save it
   const result = await settings.persistExistingVolumeIfPreconditionHolds('https://ghost.example/', 150, () => true);
   assert.equal(result.aborted, true);
   assert.equal(result.code, 'PAGE_NOT_SAVED');
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal('https://ghost.example/' in pages, false);
 });
 
@@ -414,7 +434,7 @@ test('persistExistingVolumeIfPreconditionHolds is rejected when the precondition
   const result = await settings.persistExistingVolumeIfPreconditionHolds('https://guarded.example/', 150, () => false);
   assert.equal(result.aborted, true);
   assert.equal(result.code, 'PRECONDITION_FAILED');
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://guarded.example/'], DEFAULT_VOLUME_PERCENT);
 });
 
@@ -427,7 +447,7 @@ test('a delayed persist after Remove does not re-save the page', async () => {
   const result = await settings.persistExistingVolumeIfPreconditionHolds('https://removed.example/', 150, () => true);
   assert.equal(result.aborted, true);
   assert.equal(result.code, 'PAGE_NOT_SAVED');
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('a delayed persist after Clear all does not re-save the page', async () => {
@@ -437,7 +457,7 @@ test('a delayed persist after Clear all does not re-save the page', async () => 
   const result = await settings.persistExistingVolumeIfPreconditionHolds('https://cleared.example/', 150, () => true);
   assert.equal(result.aborted, true);
   assert.equal(result.code, 'PAGE_NOT_SAVED');
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('a valid, active-session persist still updates the value for an already-saved page', async () => {
@@ -446,7 +466,7 @@ test('a valid, active-session persist still updates the value for an already-sav
   const result = await settings.persistExistingVolumeIfPreconditionHolds('https://ok.example/', 160, () => true);
   assert.equal(result.aborted, false);
   assert.equal(result.volumePercent, 160);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://ok.example/'], 160);
 });
 
@@ -455,7 +475,7 @@ test('updating one saved URL never changes another URL on the same hostname', as
   await settings.addSavedPage('https://shared-host.example/page-a', DEFAULT_VOLUME_PERCENT);
   await settings.addSavedPage('https://shared-host.example/page-b', DEFAULT_VOLUME_PERCENT);
   await settings.persistExistingVolumeIfPreconditionHolds('https://shared-host.example/page-a', 190, () => true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://shared-host.example/page-a'], 190);
   assert.equal(pages['https://shared-host.example/page-b'], DEFAULT_VOLUME_PERCENT);
 });
@@ -503,7 +523,7 @@ test('a concurrent addSavedPage during a delayed first-run schema initialization
   releaseDelayedWrite();
 
   await Promise.all([getPromise, addPromise]);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, { 'https://race.example/': DEFAULT_VOLUME_PERCENT });
 });
 
@@ -557,7 +577,7 @@ test('clearSavedPages awaits schema initialization before writing - it never rac
   assert.deepEqual(setCallOrder, ['schema-init', 'clear']);
   const readSettings = await settings.getSettings();
   assert.equal(readSettings.schemaVersion, SCHEMA_VERSION);
-  assert.deepEqual(await settings.getSavedPages(), {});
+  assert.deepEqual(await savedVolumes(), {});
 });
 
 test('schema initialization runs exactly once even under many concurrent first callers', async () => {
@@ -594,7 +614,7 @@ test('schema initialization runs exactly once even under many concurrent first c
 
   // Exactly one schema-reset write, plus one write per addSavedPage call.
   assert.equal(setCallCount, 3);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, {
     'https://p1.example/': DEFAULT_VOLUME_PERCENT,
     'https://p2.example/': DEFAULT_VOLUME_PERCENT,
@@ -631,7 +651,7 @@ test('a failed schema initialization can be retried by a later caller', async ()
   await assert.rejects(() => settings.getSavedPages());
   // The module state must have reset so a later call retries from scratch
   // rather than being permanently wedged.
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, {});
 });
 
@@ -655,7 +675,7 @@ test('persistExistingVolumeIfPreconditionHolds: a precondition that becomes fals
   const result = await resultPromise;
   assert.equal(result.aborted, true);
   assert.equal(result.code, 'PRECONDITION_FAILED');
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://race-persist.example/'], DEFAULT_VOLUME_PERCENT); // untouched, never bumped to 180
 });
 
@@ -679,7 +699,7 @@ test('persistExistingVolumeIfPreconditionHolds: a precondition invalidated while
 
   const result = await resultPromise;
   assert.equal(result.aborted, true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://compensate-persist.example/'], DEFAULT_VOLUME_PERCENT, 'restored to the previous value, never left stale at 170');
 });
 
@@ -700,7 +720,7 @@ test('a concurrent Add queued behind a compensated persist still succeeds normal
 
   const [persistResult] = await Promise.all([persistPromise, addPromise]);
   assert.equal(persistResult.aborted, true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.equal(pages['https://compensate-then-add.example/'], DEFAULT_VOLUME_PERCENT, 'restored, not left stale');
   assert.equal(pages['https://queued-after-persist.example/'], DEFAULT_VOLUME_PERCENT, 'the queued Add still wins normally');
 });
@@ -719,6 +739,288 @@ test('Clear-all queued behind a compensated persist still produces an empty save
 
   const [persistResult] = await Promise.all([persistPromise, clearPromise]);
   assert.equal(persistResult.aborted, true);
-  const pages = await settings.getSavedPages();
+  const pages = await savedVolumes();
   assert.deepEqual(pages, {}, 'Clear-all queued behind the compensated persist still produces an empty saved-pages map');
+});
+
+// ===========================================================================
+// Schema 6: saved pages are stored as RECORDS
+// ({volumePercent, titleSnapshot, customName}) rather than bare numbers.
+// These tests exercise the schema-5 -> schema-6 migration and the
+// record-level mutations (metadata refresh rules, rename) directly against
+// the real shared/settings.js storage layer.
+// ===========================================================================
+
+test('schema6 #1/#2/#3: a schema-5 numeric entry migrates to a record, preserving the volume, with empty metadata', async () => {
+  const getStore = installChromeStub({
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://five-a.example/': 209,
+      'https://five-b.example/': 40,
+    },
+  });
+
+  const pages = await settings.getSavedPages();
+  assert.deepEqual(pages, {
+    'https://five-a.example/': { volumePercent: 209, titleSnapshot: '', customName: '' },
+    'https://five-b.example/': { volumePercent: 40, titleSnapshot: '', customName: '' },
+  });
+
+  const readSettings = await settings.getSettings();
+  assert.equal(readSettings.schemaVersion, SCHEMA_VERSION);
+  assert.equal(SCHEMA_VERSION, 6);
+  // The migrated records are what is actually persisted, not just what is read back.
+  assert.deepEqual(getStore()[STORAGE_KEYS.SAVED_PAGES]['https://five-a.example/'], {
+    volumePercent: 209,
+    titleSnapshot: '',
+    customName: '',
+  });
+});
+
+test('schema6 #5/#10: schema-5 migration drops invalid URLs and keeps distinct path/query/fragment separate', async () => {
+  installChromeStub({
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://keep.example/one': 100,
+      'https://keep.example/two': 110,
+      'https://keep.example/one?x=1': 120,
+      'https://keep.example/one#frag': 130,
+      'not a URL': 100,
+      'chrome://settings/': 100,
+      'https://user:pass@creds.example/': 100,
+      'https://out-of-range.example/': 999,
+    },
+  });
+
+  assert.deepEqual(await savedVolumes(), {
+    'https://keep.example/one': 100,
+    'https://keep.example/two': 110,
+    'https://keep.example/one?x=1': 120,
+    'https://keep.example/one#frag': 130,
+  });
+});
+
+test('schema6 #4: an existing schema-6 profile with real metadata survives normalization untouched', async () => {
+  installChromeStub({
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://meta.example/': { volumePercent: 175, titleSnapshot: 'A Real Title', customName: 'My Name' },
+    },
+  });
+  assert.deepEqual(await settings.getSavedPages(), {
+    'https://meta.example/': { volumePercent: 175, titleSnapshot: 'A Real Title', customName: 'My Name' },
+  });
+});
+
+test('schema6 #6: invalid metadata types are normalized safely and untrusted extra properties are dropped', async () => {
+  installChromeStub({
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://messy.example/': { volumePercent: 120, titleSnapshot: 99, customName: ['x'], evil: 'payload' },
+      'https://broken.example/': { volumePercent: 'loud', titleSnapshot: '', customName: '' },
+    },
+  });
+  const pages = await settings.getSavedPages();
+  assert.deepEqual(pages, {
+    'https://messy.example/': { volumePercent: 120, titleSnapshot: '', customName: '' },
+  });
+  assert.equal('evil' in pages['https://messy.example/'], false);
+});
+
+test('schema6 #7: a failed schema-5 -> schema-6 write leaves the ORIGINAL numeric data intact and is retryable', async () => {
+  let failNextSet = true;
+  const store = {
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES },
+    [STORAGE_KEYS.SAVED_PAGES]: { 'https://retry-six.example/': 165 },
+  };
+  globalThis.chrome = {
+    storage: {
+      local: {
+        async get(key) {
+          if (typeof key === 'string') {
+            return Object.prototype.hasOwnProperty.call(store, key) ? { [key]: store[key] } : {};
+          }
+          return { ...store };
+        },
+        async set(obj) {
+          if (failNextSet) {
+            failNextSet = false;
+            throw new Error('simulated storage failure');
+          }
+          Object.assign(store, obj);
+        },
+        async remove(key) {
+          delete store[key];
+        },
+      },
+    },
+  };
+  settings.__resetForTests();
+
+  await assert.rejects(() => settings.getSavedPages(), /simulated storage failure/);
+  // Nothing was destroyed - the original schema-5 numeric map is still there.
+  assert.deepEqual(store[STORAGE_KEYS.SAVED_PAGES], { 'https://retry-six.example/': 165 });
+  assert.equal(store[STORAGE_KEYS.SETTINGS].schemaVersion, LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES);
+
+  // A later caller retries the migration and succeeds, preserving the volume.
+  assert.deepEqual(await settings.getSavedPages(), {
+    'https://retry-six.example/': { volumePercent: 165, titleSnapshot: '', customName: '' },
+  });
+  assert.equal(store[STORAGE_KEYS.SETTINGS].schemaVersion, SCHEMA_VERSION);
+});
+
+test('schema6 #8: a schema-5 migration racing many concurrent callers still runs exactly once', async () => {
+  let setCalls = 0;
+  const store = {
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES },
+    [STORAGE_KEYS.SAVED_PAGES]: { 'https://single-flight.example/': 155 },
+  };
+  globalThis.chrome = {
+    storage: {
+      local: {
+        async get(key) {
+          if (typeof key === 'string') {
+            return Object.prototype.hasOwnProperty.call(store, key) ? { [key]: store[key] } : {};
+          }
+          return { ...store };
+        },
+        async set(obj) {
+          setCalls += 1;
+          Object.assign(store, obj);
+        },
+        async remove(key) {
+          delete store[key];
+        },
+      },
+    },
+  };
+  settings.__resetForTests();
+
+  const results = await Promise.all([
+    settings.getSavedPages(),
+    settings.getSavedPages(),
+    settings.getSavedPages(),
+    settings.addSavedPage('https://concurrent-add.example/', 120),
+  ]);
+  // Exactly one migration write, plus the one concurrent add's own write.
+  assert.equal(setCalls, 2, 'the migration itself wrote exactly once');
+  assert.deepEqual(results[0], {
+    'https://single-flight.example/': { volumePercent: 155, titleSnapshot: '', customName: '' },
+  });
+  const final = await settings.getSavedPages();
+  assert.equal(final['https://single-flight.example/'].volumePercent, 155, 'the migrated page survived the concurrent add');
+  assert.equal(final['https://concurrent-add.example/'].volumePercent, 120);
+});
+
+// --- Record-level metadata mutations ---
+
+test('schema6: addSavedPage stores a titleSnapshot and sanitizes it', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://titled.example/', 150, { titleSnapshot: '   My   Great\nPage   ' });
+  const pages = await settings.getSavedPages();
+  assert.deepEqual(pages['https://titled.example/'], {
+    volumePercent: 150,
+    titleSnapshot: 'My Great Page',
+    customName: '',
+  });
+});
+
+test('schema6 #14: re-saving refreshes the titleSnapshot but PRESERVES an existing customName', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://refresh.example/', 150, { titleSnapshot: 'Old Title' });
+  await settings.renameSavedPage('https://refresh.example/', 'User Chosen');
+
+  // "Add this page" again, with a new live tab title and no customName supplied.
+  await settings.addSavedPage('https://refresh.example/', 999, { titleSnapshot: 'New Title' });
+
+  const record = (await settings.getSavedPages())['https://refresh.example/'];
+  assert.equal(record.titleSnapshot, 'New Title', 'the snapshot refreshes from the live tab title');
+  assert.equal(record.customName, 'User Chosen', 'the user-chosen name survives untouched');
+  assert.equal(record.volumePercent, 150, 'volume stays idempotent on a re-save');
+});
+
+test('schema6 #15: a manual add stores a customName and leaves titleSnapshot empty', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://manual-named.example/', 175, { customName: '  Movie   Night  ' });
+  assert.deepEqual((await settings.getSavedPages())['https://manual-named.example/'], {
+    volumePercent: 175,
+    titleSnapshot: '',
+    customName: 'Movie Night',
+  });
+});
+
+test('schema6: a manual re-add preserves an existing titleSnapshot and only replaces a supplied name', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://both.example/', 150, { titleSnapshot: 'Captured Title' });
+  await settings.addSavedPage('https://both.example/', 150, { customName: 'Manual Name' });
+  const record = (await settings.getSavedPages())['https://both.example/'];
+  assert.equal(record.titleSnapshot, 'Captured Title', 'the captured title is preserved');
+  assert.equal(record.customName, 'Manual Name');
+
+  // An empty name never clears an existing one here - only Rename does that.
+  await settings.addSavedPage('https://both.example/', 150, { customName: '' });
+  assert.equal((await settings.getSavedPages())['https://both.example/'].customName, 'Manual Name');
+});
+
+test('schema6 #59: renameSavedPage changes ONLY customName', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://rename.example/', 175, { titleSnapshot: 'Snapshot' });
+  await settings.renameSavedPage('https://rename.example/', '  New   Name  ');
+  assert.deepEqual((await settings.getSavedPages())['https://rename.example/'], {
+    volumePercent: 175,
+    titleSnapshot: 'Snapshot',
+    customName: 'New Name',
+  });
+});
+
+test('schema6 #60: an empty rename CLEARS the override without touching anything else', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://clear-name.example/', 175, { titleSnapshot: 'Snapshot', customName: 'Old' });
+  await settings.renameSavedPage('https://clear-name.example/', '   ');
+  assert.deepEqual((await settings.getSavedPages())['https://clear-name.example/'], {
+    volumePercent: 175,
+    titleSnapshot: 'Snapshot',
+    customName: '',
+  });
+});
+
+test('schema6 #65: renaming a page that is not saved is a structured no-op, never a resurrection', async () => {
+  installChromeStub({});
+  const result = await settings.renameSavedPage('https://ghost.example/', 'Nope');
+  assert.equal(result.aborted, true);
+  assert.equal(result.code, 'PAGE_NOT_SAVED');
+  assert.deepEqual(await settings.getSavedPages(), {});
+});
+
+test('schema6: a volume commit preserves the record metadata (never discards a name or title)', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://vol.example/', 100, { titleSnapshot: 'T', customName: 'N' });
+  const result = await settings.persistExistingVolumeIfPreconditionHolds('https://vol.example/', 240, () => true);
+  assert.equal(result.aborted, false);
+  assert.deepEqual((await settings.getSavedPages())['https://vol.example/'], {
+    volumePercent: 240,
+    titleSnapshot: 'T',
+    customName: 'N',
+  });
+});
+
+test('schema6: a compensated (precondition-invalidated) volume write restores the volume AND keeps metadata', async () => {
+  installChromeStub({});
+  await settings.addSavedPage('https://compensate-meta.example/', 100, { titleSnapshot: 'T', customName: 'N' });
+  let allow = true;
+  const result = await settings.persistExistingVolumeIfPreconditionHolds(
+    'https://compensate-meta.example/',
+    240,
+    () => {
+      const current = allow;
+      allow = false; // becomes false after the first check
+      return current;
+    }
+  );
+  assert.equal(result.aborted, true);
+  assert.deepEqual((await settings.getSavedPages())['https://compensate-meta.example/'], {
+    volumePercent: 100,
+    titleSnapshot: 'T',
+    customName: 'N',
+  });
 });

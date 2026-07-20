@@ -33,6 +33,18 @@ export const MESSAGE_TYPES = Object.freeze({
   // committed exactly once, separately, through UPDATE_SAVED_PAGE_VOLUME on
   // the slider's `change` event.
   SET_SAVED_PAGE_LIVE_GAIN: 'SET_SAVED_PAGE_LIVE_GAIN',
+  // Options/saved-pages-view -> service worker: sets ONE saved page's local
+  // customName override (display only). Never touches volumePercent,
+  // titleSnapshot, or any capture session. An empty string clears the
+  // override, so the display name falls back to titleSnapshot then a locally
+  // derived URL label.
+  RENAME_SAVED_PAGE: 'RENAME_SAVED_PAGE',
+  // Options/saved-pages-view -> service worker: bulk operations over an
+  // explicit list of exact pageKeys (the view's current selection). Both
+  // return structured PER-PAGE results - one page's failure never blocks an
+  // unrelated page, and a failed page is never reported as succeeded.
+  RESET_SELECTED_SAVED_PAGES_TO_100: 'RESET_SELECTED_SAVED_PAGES_TO_100',
+  DELETE_SELECTED_SAVED_PAGES: 'DELETE_SELECTED_SAVED_PAGES',
   START_CAPTURE: 'START_CAPTURE',
   STOP_CAPTURE: 'STOP_CAPTURE',
   SET_TAB_GAIN: 'SET_TAB_GAIN',
@@ -97,6 +109,16 @@ export const SESSION_STOP_REASONS = Object.freeze({
 });
 
 export const DEFAULT_VOLUME_PERCENT = 100;
+
+// Saved-page metadata limits (schema 6). Both are local-only display strings;
+// neither is ever fetched, and neither affects exact-page matching.
+export const MAX_TITLE_SNAPSHOT_LENGTH = 200;
+export const MAX_CUSTOM_NAME_LENGTH = 120;
+
+// Upper bound on a single bulk (reset/delete) request's pageKeys array. Far
+// above any realistic saved-page count, but bounded so a malformed or hostile
+// options-page payload can never enqueue unbounded work in the service worker.
+export const MAX_BULK_PAGE_KEYS = 1000;
 export const MIN_GAIN_PERCENT = 0;
 // GainNode gain is gainPercent/100, so 100% = 1.0, 200% = 2.0, 300% = 3.0.
 // There is no compressor/limiter anywhere - gain above 100% is plain
@@ -117,8 +139,15 @@ export const STORAGE_KEYS = Object.freeze({
   LEGACY_ALLOWED_PAGES: 'allowedPages',
 });
 
-export const SCHEMA_VERSION = 5;
+// Schema 6 stores each saved page as a RECORD:
+//   { volumePercent, titleSnapshot, customName }
+// rather than schema 5's bare number. titleSnapshot/customName are local-only
+// display metadata - see shared/saved-page-metadata.js.
+export const SCHEMA_VERSION = 6;
 export const LEGACY_SCHEMA_VERSION_WITH_ALLOWED_PAGES = 4;
+// Schema 5's savedPages map: { pageKey: volumePercent } - migrated in place to
+// schema-6 records (volume preserved, metadata fields empty).
+export const LEGACY_SCHEMA_VERSION_WITH_NUMERIC_VOLUMES = 5;
 
 export const OFFSCREEN_DOCUMENT_PATH = 'offscreen/offscreen.html';
 export const SERVICE_WORKER_SCRIPT_PATH = 'service-worker.js';
