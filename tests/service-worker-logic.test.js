@@ -11,6 +11,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   TARGETS,
   MESSAGE_TYPES,
@@ -36,6 +39,7 @@ import {
 } from '../shared/offscreen-state.js';
 
 const FAKE_EXTENSION_ID = 'fake-extension-id';
+const ROOT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // ---------------------------------------------------------------------------
 // Fake offscreen responder: mirrors real offscreen.js's message contract -
@@ -5852,4 +5856,287 @@ test('page-audio: a page-audio session survives reconciliation (offscreen knows 
   assert.equal(state.data.state, 'active', 'the page-audio session was not wrongly discarded');
   assert.equal(state.data.backend, 'page-audio');
   assert.equal(state.data.gainPercent, 190);
+});
+
+// ===========================================================================
+// v0.3.0 Stage 2: resource lifecycle.
+//
+// These assert that repeated use does not accumulate anything - neither
+// service-worker records nor offscreen resources - and that the offscreen
+// document is closed once the compatibility backend has genuinely nothing
+// left to do. All timing is driven by a controlled short delay, never a sleep.
+// ===========================================================================
+
+test('stage2 #6/#7: navigation and tab close leave no page-audio frame records behind', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://frames.example/a';
+  const pageB = 'https://frames.example/b';
+  setTab(tabId, pageA);
+  setInjectableFrames(tabId, [
+    { frameId: 0, documentId: 'doc-top' },
+    { frameId: 1, documentId: 'doc-child' },
+  ]);
+
+  await enablePageAudio(tabId, 180);
+  assert.equal(sw.__getRuntimeStateForTests().pageAudioFrames.frames, 2, 'both frames were recorded');
+
+  setTab(tabId, pageB);
+  await fireCommitted(tabId, pageB);
+  await tick(20);
+
+  const afterNavigation = sw.__getRuntimeStateForTests();
+  assert.deepEqual(afterNavigation.pageAudioFrames, { tabs: 0, frames: 0 }, 'navigation released every frame record');
+  assert.equal(afterNavigation.sessions, 0, 'and the session itself');
+});
+
+test('stage2: closing a tab releases its page-audio records unconditionally', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://frames.example/closing');
+  await enablePageAudio(tabId, 150);
+  assert.equal(sw.__getRuntimeStateForTests().pageAudioFrames.frames, 1);
+
+  removeTabData(tabId);
+  await fireTabRemoved(tabId);
+  await tick(20);
+
+  assert.deepEqual(sw.__getRuntimeStateForTests().pageAudioFrames, { tabs: 0, frames: 0 });
+});
+
+test('stage2 #8: ten page-audio enable/disable cycles do not grow service-worker state', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://cycles.example/page');
+
+  for (let cycle = 0; cycle < 10; cycle += 1) {
+    await enablePageAudio(tabId, 150 + cycle);
+    const active = sw.__getRuntimeStateForTests();
+    assert.equal(active.sessions, 1, `cycle ${cycle}: exactly one session`);
+    assert.equal(active.pageAudioFrames.frames, 1, `cycle ${cycle}: exactly one frame record`);
+
+    await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+    const idle = sw.__getRuntimeStateForTests();
+    assert.equal(idle.sessions, 0, `cycle ${cycle}: session released`);
+    assert.deepEqual(idle.pageAudioFrames, { tabs: 0, frames: 0 }, `cycle ${cycle}: frame records released`);
+  }
+
+  assert.equal(tabCaptureCalls, 0, 'ten page-audio cycles never touched tabCapture');
+  assert.equal(createDocumentCallCount, 0, 'and never created an offscreen document');
+});
+
+test('stage2 #1/#2/#3/#4: repeated page-audio gain changes reuse one controller and one graph', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://cycles.example/gain');
+  const { data } = await enablePageAudio(tabId, 100);
+
+  const installsAfterStart = pageControllers.get(`${tabId}:0`).installed;
+  for (let i = 0; i < 10; i += 1) {
+    await send(MESSAGE_TYPES.SET_TAB_GAIN, {
+      tabId,
+      gainPercent: 100 + i * 20,
+      expectedOperationId: data.operationId,
+    });
+  }
+
+  assert.equal(
+    pageControllers.get(`${tabId}:0`).installed,
+    installsAfterStart,
+    'ten gain changes installed no additional controller'
+  );
+  assert.equal(executeScriptCalls.filter((c) => c.world === 'MAIN').length, 1, 'the MAIN controller was injected once');
+  assert.equal(pageGainFor(tabId), 280, 'the final value is authoritative');
+  assert.equal(sw.__getRuntimeStateForTests().pageAudioFrames.frames, 1, 'still exactly one frame record');
+});
+
+test('stage2 #14/#15: ten compatibility cycles leave zero sessions and zero pending work', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://compat-cycles.example/page');
+
+  for (let cycle = 0; cycle < 10; cycle += 1) {
+    const started = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 150));
+    assert.equal(started.ok, true, `cycle ${cycle} started`);
+    assert.equal(offscreenResponder.sessions.size, 1, `cycle ${cycle}: one offscreen session`);
+
+    const stopped = await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+    assert.equal(stopped.ok, true, `cycle ${cycle} stopped`);
+    assert.equal(offscreenResponder.sessions.size, 0, `cycle ${cycle}: offscreen session released`);
+    assert.equal(offscreenResponder.pending.size, 0, `cycle ${cycle}: no PendingStart left`);
+  }
+
+  const state = sw.__getRuntimeStateForTests();
+  assert.equal(state.sessions, 0, 'no service-worker session survived');
+  assert.equal(state.inFlightCompatibilityOperations, 0, 'no operation left in flight');
+});
+
+test('stage2 #12/#13: compatibility teardown is idempotent and a stale stop cannot kill a newer session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://compat-idem.example/page');
+
+  const first = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 150));
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  // A duplicate stop is a harmless no-op.
+  const duplicate = await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  assert.equal(duplicate.ok, true, 'a repeated teardown is idempotent');
+
+  // A brand-new session must survive a stale teardown aimed at the old one.
+  const second = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 200));
+  assert.notEqual(second.data.operationId, first.data.operationId);
+
+  const staleTeardown = await dispatch({
+    target: TARGETS.OFFSCREEN,
+    type: MESSAGE_TYPES.STOP_CAPTURE,
+    requestId: 'stale-stop',
+    payload: { tabId, operationId: first.data.operationId, force: false },
+  });
+  assert.equal(staleTeardown.data.status, 'operation_mismatch', 'the stale stop touched nothing');
+  assert.equal(offscreenResponder.sessions.has(tabId), true, 'the newer session is still live');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 200);
+});
+
+test('stage2 #16/#19/#20: the offscreen document closes when idle, and a later start recreates it once', async () => {
+  resetEverything();
+  sw.__setOffscreenIdleCloseDelayForTests(30);
+  const tabId = freshTabId();
+  setTab(tabId, 'https://idle.example/page');
+
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 150));
+  assert.equal(createDocumentCallCount, 1, 'the document was created once');
+  assert.equal(offscreenDocumentCreated, true);
+
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  assert.equal(sw.__getRuntimeStateForTests().compatibilityIdle, true, 'nothing is left to do');
+
+  await tick(120); // past the controlled idle delay
+  assert.equal(offscreenDocumentCreated, false, 'the idle document was closed');
+  assert.equal(closeDocumentCallCount, 1, 'closed exactly once');
+
+  // The next explicit compatibility start recreates it, exactly once.
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 175));
+  assert.equal(createDocumentCallCount, 2, 'recreated once for the new start');
+  assert.equal(offscreenDocumentCreated, true);
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 175);
+});
+
+test('stage2 #17: a new compatibility start cancels a pending idle close', async () => {
+  resetEverything();
+  sw.__setOffscreenIdleCloseDelayForTests(60);
+  const tabId = freshTabId();
+  setTab(tabId, 'https://idle-cancel.example/page');
+
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 150));
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId });
+  assert.equal(sw.__getRuntimeStateForTests().offscreenIdleCloseScheduled, true, 'a close is pending');
+
+  // Start again before the debounce elapses.
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 190));
+  await tick(150);
+
+  assert.equal(offscreenDocumentCreated, true, 'the document survived - the close was cancelled');
+  assert.equal(closeDocumentCallCount, 0, 'nothing was closed while a session is live');
+  assert.equal(offscreenResponder.sessions.get(tabId).gainPercent, 190);
+});
+
+test('stage2 #21/#22: two live compatibility tabs prevent idle close; stopping one preserves the other', async () => {
+  resetEverything();
+  sw.__setOffscreenIdleCloseDelayForTests(30);
+  const tabA = freshTabId();
+  const tabB = freshTabId();
+  setTab(tabA, 'https://idle-two.example/a');
+  setTab(tabB, 'https://idle-two.example/b');
+
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabA, 150));
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabB, 160));
+  assert.equal(offscreenResponder.sessions.size, 2);
+
+  // Stopping one leaves the other running, so the document must stay open.
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId: tabA });
+  await tick(120);
+
+  assert.equal(offscreenDocumentCreated, true, 'a still-active session keeps the document alive');
+  assert.equal(closeDocumentCallCount, 0);
+  assert.equal(offscreenResponder.sessions.has(tabB), true, 'the surviving session is untouched');
+  assert.equal(offscreenResponder.sessions.get(tabB).gainPercent, 160);
+
+  // Only once the last one stops does the document become idle.
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId: tabB });
+  await tick(120);
+  assert.equal(offscreenDocumentCreated, false, 'now it closes');
+});
+
+test('stage2: a live page-audio session never keeps the offscreen document alive', async () => {
+  resetEverything();
+  sw.__setOffscreenIdleCloseDelayForTests(30);
+  const compatTab = freshTabId();
+  const pageAudioTab = freshTabId();
+  setTab(compatTab, 'https://mixed.example/compat');
+  setTab(pageAudioTab, 'https://mixed.example/page-audio');
+
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(compatTab, 150));
+  await enablePageAudio(pageAudioTab, 200);
+
+  // Stop only the compatibility session; the page-audio one keeps running.
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId: compatTab });
+  await tick(120);
+
+  assert.equal(offscreenDocumentCreated, false, 'page-audio owns no offscreen resource, so the document closed');
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId: pageAudioTab });
+  assert.equal(state.data.state, 'active', 'the page-audio session is unaffected by the close');
+  assert.equal(pageGainFor(pageAudioTab), 200);
+});
+
+test('stage2 #11: a failed compatibility start leaves no session, no pending start, and no live graph', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://failed-start.example/page');
+
+  offscreenResponder.setStartCaptureOverride(() => ({
+    ok: false,
+    error: { code: ERROR_CODES.CAPTURE_FAILED, message: 'simulated failure' },
+  }));
+
+  const response = await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 150));
+  assert.equal(response.ok, false);
+
+  assert.equal(offscreenResponder.sessions.size, 0, 'no offscreen session survived the failed start');
+  assert.equal(offscreenResponder.pending.size, 0, 'no PendingStart was orphaned');
+  const state = sw.__getRuntimeStateForTests();
+  assert.equal(state.sessions, 0, 'no service-worker session survived');
+  assert.equal(state.inFlightCompatibilityOperations, 0, 'the in-flight counter was released');
+
+  offscreenResponder.setStartCaptureOverride(null);
+});
+
+test('stage2 #23: no video track is ever requested - the capture path is audio-only', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  setTab(tabId, 'https://audio-only.example/page');
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(tabId, 150));
+
+  // getMediaStreamId only ever yields an audio-consumed stream id here; the
+  // offscreen document's own contract test covers the constraint shape.
+  const offscreenSource = readFileSync(path.join(ROOT_DIR, 'offscreen/offscreen.js'), 'utf8');
+  assert.equal(/video\s*:\s*true/.test(offscreenSource), false, 'no video track is requested');
+  assert.equal(offscreenSource.includes('MediaRecorder'), false, 'nothing records the stream');
+});
+
+test('stage2: mixed backends stay independent - stopping one never disturbs the other', async () => {
+  resetEverything();
+  const compatTab = freshTabId();
+  const pageTab = freshTabId();
+  setTab(compatTab, 'https://independent.example/compat');
+  setTab(pageTab, 'https://independent.example/page');
+
+  await send(MESSAGE_TYPES.START_CAPTURE, startPayload(compatTab, 220));
+  await enablePageAudio(pageTab, 130);
+
+  await send(MESSAGE_TYPES.STOP_CAPTURE, { tabId: pageTab });
+
+  assert.equal(offscreenResponder.sessions.get(compatTab).gainPercent, 220, 'the compatibility session is untouched');
+  assert.equal(pageGainFor(pageTab), 100, 'the page-audio session returned to neutral');
+  const state = sw.__getRuntimeStateForTests();
+  assert.equal(state.sessions, 1, 'only the compatibility session remains');
 });

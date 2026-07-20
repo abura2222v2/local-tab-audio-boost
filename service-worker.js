@@ -17,6 +17,7 @@ import {
   OFFSCREEN_DOCUMENT_PATH,
   OFFSCREEN_RESPONSE_TIMEOUT_MS,
   PAGE_AUDIO_RESPONSE_TIMEOUT_MS,
+  OFFSCREEN_IDLE_CLOSE_MS,
   MIN_GAIN_PERCENT,
   MAX_GAIN_PERCENT,
 } from './shared/constants.js';
@@ -37,6 +38,7 @@ import {
   describeRefusal,
 } from './shared/page-audio-policy.js';
 import { createPageAudioRegistry } from './shared/page-audio-session.js';
+import { createOffscreenIdleCloser } from './shared/offscreen-idle.js';
 import { canonicalizePageKey } from './shared/urls.js';
 import * as settingsStore from './shared/settings.js';
 
@@ -122,7 +124,51 @@ async function offscreenDocumentExists() {
   return contexts.some((context) => context.documentUrl === offscreenUrl);
 }
 
+/**
+ * In-flight compatibility operations (starts and stops). An idle check that
+ * only looked at `sessions` would miss a capture that is mid-start, so the
+ * document could be closed out from under it.
+ */
+let inFlightCompatibilityOperations = 0;
+
+/** True only when the compatibility backend holds nothing at all. */
+function compatibilityBackendIsIdle() {
+  if (inFlightCompatibilityOperations > 0) return false;
+  for (const entry of sessions.values()) {
+    // A page-audio session owns no offscreen resource, so it never keeps the
+    // document alive.
+    if (!isPageAudioSession(entry)) return false;
+  }
+  return true;
+}
+
+let offscreenIdleCloseDelayMs = OFFSCREEN_IDLE_CLOSE_MS;
+
+const offscreenIdleCloser = createOffscreenIdleCloser({
+  isIdle: () => compatibilityBackendIsIdle(),
+  closeDocument: async (stillIdle) => {
+    // Tolerate an already-closed document; only close one that really exists.
+    if (!(await offscreenDocumentExists())) return;
+    // That lookup was an asynchronous gap. A compatibility start could have
+    // created a document and begun capturing in it since this close was
+    // approved, so the authoritative state is re-checked here - immediately
+    // before the irreversible step - never only when the timer fired.
+    if (!stillIdle()) return;
+    await chrome.offscreen.closeDocument();
+  },
+  delayMs: OFFSCREEN_IDLE_CLOSE_MS,
+  setTimeoutFn: (fn) => setTimeout(fn, offscreenIdleCloseDelayMs),
+  clearTimeoutFn: (id) => clearTimeout(id),
+});
+
+/** Arms the debounced idle close if - and only if - nothing is left to do. */
+function maybeScheduleOffscreenIdleClose() {
+  offscreenIdleCloser.schedule();
+}
+
 async function ensureOffscreenDocument() {
+  // Any new compatibility work cancels a pending close outright.
+  offscreenIdleCloser.cancel();
   if (await offscreenDocumentExists()) return;
   if (!offscreenCreationPromise) {
     offscreenCreationPromise = chrome.offscreen
@@ -297,6 +343,7 @@ async function requestOffscreenTeardown(tabId, { operationId, force = false, rea
     }
     pageAudioFrames.removeTab(tabId);
     void reason;
+    maybeScheduleOffscreenIdleClose();
     return { ok: true, data: { tabId, backend: BACKENDS.PAGE_AUDIO } };
   }
 
@@ -307,6 +354,8 @@ async function requestOffscreenTeardown(tabId, { operationId, force = false, rea
     if (stillCurrent && (force || !operationId || stillCurrent.operationId === operationId)) {
       sessions.delete(tabId);
     }
+    // The last compatibility session may have just gone away.
+    maybeScheduleOffscreenIdleClose();
     return response;
   }
 
@@ -858,6 +907,18 @@ async function cleanUpAmbiguousOffscreenAttempt(tabId, operationId) {
  * before calling this.
  */
 async function beginCaptureForPage(tabId, pageKey, operationId, initialGainPercent) {
+  inFlightCompatibilityOperations += 1;
+  try {
+    return await beginCaptureForPageInner(tabId, pageKey, operationId, initialGainPercent);
+  } finally {
+    inFlightCompatibilityOperations -= 1;
+    // Whether it succeeded or failed, this is a moment worth re-evaluating:
+    // a failed start may have left nothing behind at all.
+    maybeScheduleOffscreenIdleClose();
+  }
+}
+
+async function beginCaptureForPageInner(tabId, pageKey, operationId, initialGainPercent) {
   function stillCurrent() {
     const entry = sessions.get(tabId);
     return Boolean(entry) && entry.operationId === operationId && entry.state === 'starting';
@@ -2066,6 +2127,10 @@ export function __resetForTests() {
   reconciliationComplete = false;
   offscreenCreationPromise = null;
   offscreenResponseTimeoutMs = OFFSCREEN_RESPONSE_TIMEOUT_MS;
+  pageAudioFrames.clear();
+  inFlightCompatibilityOperations = 0;
+  offscreenIdleCloser.cancel();
+  offscreenIdleCloseDelayMs = OFFSCREEN_IDLE_CLOSE_MS;
 }
 
 /**
@@ -2073,6 +2138,21 @@ export function __resetForTests() {
  * timeout-path test runs deterministically off a controlled value instead of
  * a multi-second real-wall-clock sleep. Never called by any extension context.
  */
+export function __setOffscreenIdleCloseDelayForTests(ms) {
+  offscreenIdleCloseDelayMs = typeof ms === 'number' && ms > 0 ? ms : OFFSCREEN_IDLE_CLOSE_MS;
+}
+
+/** Test-only: the derived runtime state Stage 2 asserts stays bounded. */
+export function __getRuntimeStateForTests() {
+  return {
+    sessions: sessions.size,
+    pageAudioFrames: pageAudioFrames.size(),
+    inFlightCompatibilityOperations,
+    offscreenIdleCloseScheduled: offscreenIdleCloser.isScheduled(),
+    compatibilityIdle: compatibilityBackendIsIdle(),
+  };
+}
+
 export function __setOffscreenResponseTimeoutForTests(ms) {
   offscreenResponseTimeoutMs = typeof ms === 'number' && ms > 0 ? ms : OFFSCREEN_RESPONSE_TIMEOUT_MS;
 }

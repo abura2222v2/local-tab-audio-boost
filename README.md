@@ -15,6 +15,8 @@ explicit action you take, and the extension makes no network requests at all.
 - Local page-title snapshots, captured only when you press **Add this page**.
 - Optional custom names for saved pages.
 - Live synchronization between the popup slider and the Saved pages sliders.
+- **Fullscreen-compatible mode**: boosting normally keeps the player's own
+  fullscreen working, with no tab-capture indicator.
 - No network access, no analytics, no telemetry, no third-party dependencies.
 
 ## Installation
@@ -57,6 +59,30 @@ This extension is not published to the Chrome Web Store; load it unpacked.
   section, removes **every** saved page — including pages hidden by the current
   search and pages that are not selected.
 
+## Audio modes
+
+**Fullscreen-compatible** (the default). Pressing **Enable boosting** injects a
+small audio engine into the page and routes the player's own media through a
+gain node. Because no tab capture is involved, the page's fullscreen button and
+double-click keep working normally, and Chrome shows no capture indicator.
+Injection happens only after you press Enable, uses packaged files from the
+extension, and never reads or sends page content.
+
+Some players cannot be used this way — audio served cross-origin without CORS,
+DRM-protected media, and players inside frames the extension cannot reach. In
+those cases the popup says why and offers **Use compatibility mode** as a
+separate, deliberate choice.
+
+**Compatibility mode** uses Chrome's tab capture, as earlier versions always
+did. It works with more players, but while it is active Chrome may keep
+fullscreen inside the browser tab and shows the capture indicator. It is never
+selected automatically.
+
+When you disable boosting in fullscreen-compatible mode, the gain returns to
+100% (audibly identical to the extension not being there). The audio routing
+itself stays in place until you navigate away, because removing it could
+silence media that is already playing through it.
+
 ## Exact-page behavior
 
 Saved preferences apply to one exact address. These are three different pages,
@@ -94,6 +120,7 @@ will need to save the new address.
 | `offscreen` | Host the `AudioContext` that applies the gain (service workers have no DOM) |
 | `storage` | Store saved pages and their preferences locally |
 | `webNavigation` | Detect navigation, including same-document route changes, so boosting stops immediately |
+| `scripting` | Inject the page audio engine, only after you press Enable boosting |
 
 No host permissions, no content scripts, and no `externally_connectable`.
 
@@ -114,7 +141,10 @@ the extension in Chrome.
 
 - Capture starts only after an explicit user action, every time — Chrome
   requires this and the extension does not work around it.
-- Protected or DRM-controlled media may not be capturable.
+- Protected or DRM-controlled media may not be capturable, and cannot use
+  fullscreen-compatible mode at all.
+- Players whose audio is cross-origin without CORS, or that live in an
+  inaccessible frame, fall back to compatibility mode.
 - Raising gain above 100% is plain amplification with no limiter, so it can
   clip or distort.
 - Restricted pages (`chrome://`, the Chrome Web Store, and similar) cannot be

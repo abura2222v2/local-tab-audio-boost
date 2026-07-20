@@ -20,6 +20,21 @@ In particular:
 - No page title, favicon, or other metadata is ever looked up online.
 - Search happens entirely on your own machine, over data already stored there.
 
+## The page audio engine
+
+Fullscreen-compatible mode injects a small script into the page you are on,
+only after you press **Enable boosting**. That script:
+
+- is a packaged file shipped inside the extension — never downloaded, and never
+  generated from a string;
+- only routes the page's existing media elements through a gain node;
+- reads nothing from the page except the media addresses it must classify to
+  decide whether routing is safe;
+- sends nothing anywhere, and holds no extension privileges: it cannot read or
+  change your saved pages, reach storage, or call any Chrome API.
+
+It is removed when you navigate away or close the tab.
+
 ## What is stored locally
 
 Saved pages are stored on your device via `chrome.storage.local`, restricted to

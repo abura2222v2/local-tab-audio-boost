@@ -2,6 +2,20 @@
 
 User-visible changes only.
 
+## 0.3.0
+
+- Boosting now uses a **fullscreen-compatible** engine by default: the player's
+  own fullscreen button and double-click keep working, and Chrome no longer
+  shows the tab-capture indicator while boosting.
+- Players that cannot use it (cross-origin audio without CORS, DRM, or an
+  inaccessible frame) now say so, and offer **Use compatibility mode** as a
+  separate choice instead of silently switching.
+- The popup shows which mode is active.
+- The offscreen audio document is now closed once compatibility mode has
+  nothing left to do, and recreated on the next compatibility start.
+- Adds the `scripting` permission, used only to inject the page audio engine
+  after you press Enable boosting.
+
 ## 0.2.1
 
 - Renamed **Clear selection** to **Deselect all** to make it clearly distinct
