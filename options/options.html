@@ -22,7 +22,12 @@
     <strong>Add this page</strong> or <strong>Add URL manually</strong>.
   </p>
 
-  <p id="list-error" class="options__error" role="alert" aria-live="assertive"></p>
+  <!--
+    One status line for both outcomes. Transient success/info messages clear
+    themselves after a few seconds; errors stay until something replaces them.
+    aria-live is raised to "assertive" only for errors.
+  -->
+  <p id="status-line" class="options__status-line" role="status" aria-live="polite"></p>
 
   <section class="options__toolbar" aria-label="Search and bulk actions">
     <div class="options__search-row">
@@ -51,7 +56,7 @@
         Delete selected
       </button>
       <button id="clear-selection" type="button" class="options__button options__button--secondary" disabled>
-        Clear selection
+        Deselect all
       </button>
     </div>
 
@@ -67,11 +72,16 @@
   <p id="empty-state" class="options__empty" hidden>No pages are saved yet.</p>
   <p id="no-matches" class="options__empty" hidden>No saved pages match this search.</p>
 
-  <section class="options__danger" aria-label="Danger zone">
-    <h2 class="options__danger-heading">Danger zone</h2>
+  <!--
+    Collapsed by default on every load: native <details> starts closed because
+    it has no `open` attribute, and nothing reopens it. The expanded state is
+    deliberately not persisted.
+  -->
+  <details id="destructive-section" class="options__destructive">
+    <summary class="options__destructive-summary">Delete all saved pages</summary>
     <p class="options__note">
-      This removes <strong>every</strong> saved page, not only the ones currently shown by
-      the search or selected.
+      This removes <strong>every</strong> saved page, including pages hidden by the
+      current search and pages that are not selected.
     </p>
     <div class="options__clear-row">
       <button id="clear-button" type="button" class="options__button options__button--secondary">
@@ -83,7 +93,7 @@
         <button id="clear-confirm-cancel" type="button" class="options__button options__button--secondary">Cancel</button>
       </div>
     </div>
-  </section>
+  </details>
 </main>
 <script type="module" src="options.js"></script>
 </body>

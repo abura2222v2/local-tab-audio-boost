@@ -15,6 +15,7 @@ import { TARGETS, MESSAGE_TYPES, MIN_GAIN_PERCENT, MAX_GAIN_PERCENT, MAX_CUSTOM_
 import { registerMessageHandler, sendMessage, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
 import { createSavedPageSliderController } from '../shared/saved-page-slider.js';
 import { createClearConfirmController } from '../shared/clear-confirm.js';
+import { createNotificationController } from '../shared/notifications.js';
 import { getDisplayName } from '../shared/saved-page-metadata.js';
 import { filterSavedPageKeys } from '../shared/saved-pages-search.js';
 import {
@@ -35,7 +36,7 @@ const els = {
   list: document.getElementById('page-list'),
   emptyState: document.getElementById('empty-state'),
   noMatches: document.getElementById('no-matches'),
-  listError: document.getElementById('list-error'),
+  statusLine: document.getElementById('status-line'),
   search: document.getElementById('search-input'),
   selectAllVisible: document.getElementById('select-all-visible'),
   selectionSummary: document.getElementById('selection-summary'),
@@ -46,6 +47,8 @@ const els = {
   bulkDeleteConfirmText: document.getElementById('bulk-delete-confirm-text'),
   bulkDeleteConfirmYes: document.getElementById('bulk-delete-confirm-yes'),
   bulkDeleteConfirmCancel: document.getElementById('bulk-delete-confirm-cancel'),
+  // The destructive <details> section needs no script: it opens and closes
+  // natively, and its collapsed state is deliberately never persisted.
   clearButton: document.getElementById('clear-button'),
   clearConfirm: document.getElementById('clear-confirm'),
   clearConfirmYes: document.getElementById('clear-confirm-yes'),
@@ -69,8 +72,39 @@ function disposeRows() {
   rows.clear();
 }
 
+// Transient success/info messages clear themselves; errors stay until
+// something replaces them. See shared/notifications.js.
+const notifications = createNotificationController({
+  render: (message, kind) => {
+    els.statusLine.textContent = message ?? '';
+    els.statusLine.classList.toggle('options__status-line--error', kind === 'error');
+    els.statusLine.classList.toggle('options__status-line--success', kind === 'success');
+    els.statusLine.setAttribute('aria-live', kind === 'error' ? 'assertive' : 'polite');
+  },
+});
+
 function setError(message) {
-  els.listError.textContent = message ?? '';
+  notifications.error(message);
+}
+
+function setStatus(message) {
+  notifications.success(message);
+}
+
+function clearStatus() {
+  notifications.clear();
+}
+
+/**
+ * A bulk summary is transient only when every page succeeded. If any page
+ * failed, the summary names a real failure and must stay on screen until the
+ * user acts again.
+ */
+function reportBulkOutcome(results, options) {
+  const summary = summarizeBulkResults(results, options);
+  const anyFailed = results.some((result) => !result.ok);
+  if (anyFailed) setError(summary);
+  else setStatus(summary);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +158,7 @@ function buildRenameEditor(pageKey, record, item) {
       setError(response.error?.message ?? 'Could not rename this page.');
       return;
     }
-    setError('');
+    setStatus('Renamed page.');
     renamingPageKey = null;
     await refresh();
   };
@@ -222,7 +256,7 @@ function buildRow(pageKey, record) {
         await refresh();
         return response;
       }
-      setError('');
+      clearStatus();
       return response;
     },
   });
@@ -319,7 +353,7 @@ async function removePage(pageKey) {
     setError(response.error?.message ?? 'Could not delete this page.');
     return;
   }
-  setError('');
+  setStatus('Deleted saved page.');
   selected = toggleSelection(selected, pageKey, false);
   await refresh();
 }
@@ -342,10 +376,13 @@ els.selectAllVisible.addEventListener('change', () => {
   render();
 });
 
+// "Deselect all" only removes checkmarks. It never deletes a saved page,
+// never changes a volume, never stops capture, and writes nothing to storage.
 els.clearSelection.addEventListener('click', () => {
   selected = clearSelection();
   hideBulkDeleteConfirm();
   render();
+  setStatus('Selection cleared.');
 });
 
 els.resetSelected.addEventListener('click', async () => {
@@ -359,7 +396,7 @@ els.resetSelected.addEventListener('click', async () => {
   const results = response.data?.results ?? [];
   // Successful pages leave the selection; failed pages stay selected to retry.
   selected = applyBulkResultsToSelection(selected, results);
-  setError(summarizeBulkResults(results, { verb: 'Reset', suffix: 'to 100%' }));
+  reportBulkOutcome(results, { verb: 'Reset', suffix: 'to 100%' });
   await refresh();
 });
 
@@ -392,7 +429,7 @@ els.bulkDeleteConfirmYes.addEventListener('click', async () => {
   }
   const results = response.data?.results ?? [];
   selected = applyBulkResultsToSelection(selected, results);
-  setError(summarizeBulkResults(results, { verb: 'Deleted' }));
+  reportBulkOutcome(results, { verb: 'Deleted' });
   hideBulkDeleteConfirm();
   await refresh();
 });
@@ -414,7 +451,7 @@ els.clearConfirmCancel.addEventListener('click', () => clearConfirm.hide());
 els.clearConfirmYes.addEventListener('click', async () => {
   const result = await clearConfirm.confirm();
   if (result.ok) {
-    setError('');
+    setStatus('Cleared all saved pages.');
     selected = clearSelection();
     await refresh();
   }

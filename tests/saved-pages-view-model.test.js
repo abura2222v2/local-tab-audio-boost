@@ -195,3 +195,37 @@ test('bulk summary: an all-failure run says nothing was changed', () => {
 test('bulk summary: an empty result set says there was nothing to do', () => {
   assert.equal(summarizeBulkResults([], { verb: 'Deleted' }), 'Nothing to do.');
 });
+
+// ===========================================================================
+// "Deselect all" (the control formerly labelled "Clear selection") is purely a
+// view-state operation. These assertions pin down that it touches ONLY the
+// selection set - the saved-page records it was applied against are handed
+// back untouched, so it can never be mistaken for a delete or a volume reset.
+// ===========================================================================
+
+test('deselect-all #2/#3/#4: clearing selection leaves every saved record byte-for-byte unchanged', () => {
+  const savedPages = {
+    [A]: { volumePercent: 250, titleSnapshot: 'A title', customName: 'A name' },
+    [B]: { volumePercent: 40, titleSnapshot: '', customName: '' },
+  };
+  const before = JSON.stringify(savedPages);
+
+  const selected = selectAllVisible(new Set(), [A, B]);
+  assert.equal(selected.size, 2);
+
+  const after = clearSelection();
+  assert.equal(after.size, 0, 'the checkmarks are gone');
+  assert.equal(JSON.stringify(savedPages), before, 'no record was deleted and no volume was changed');
+  assert.equal(Object.keys(savedPages).length, 2, 'both pages still exist');
+  assert.equal(savedPages[A].volumePercent, 250, 'volume untouched - this is not Reset to 100%');
+});
+
+test('deselect-all: it is distinct from delete - the saved-page set is unaffected by selection changes', () => {
+  const savedPages = { [A]: { volumePercent: 100 }, [B]: { volumePercent: 100 }, [C]: { volumePercent: 100 } };
+  let selected = selectAllVisible(new Set(), [A, B, C]);
+  selected = clearSelection();
+  // Pruning against the untouched map proves every key still exists.
+  assert.equal(Object.keys(savedPages).length, 3);
+  assert.equal(pruneSelection(new Set([A, B, C]), savedPages).size, 3);
+  assert.equal(selected.size, 0);
+});

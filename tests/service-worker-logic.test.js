@@ -2941,29 +2941,29 @@ test('sync #9: a row commit for one exact URL never changes a different URL on t
   assert.equal(pages['https://sync-host.example/b'], 100, 'the sibling exact URL on the same hostname is untouched');
 });
 
-test('sync #10: a ChatGPT popup PERSIST commit does not modify the saved Rezka row (different exact pageKey)', async () => {
+test('sync #10: a popup PERSIST commit on one site does not modify a saved row for a different exact pageKey', async () => {
   resetEverything();
   const rezka = 'https://rezka.example/films/movie-1';
-  const chatgpt = 'https://chatgpt.example/c/abc';
+  const otherSite = 'https://docs.example/c/abc';
   await addAndAssertSaved(rezka, 150);
-  await addAndAssertSaved(chatgpt, 100);
+  await addAndAssertSaved(otherSite, 100);
 
   const chatTab = freshTabId();
-  setTab(chatTab, chatgpt);
+  setTab(chatTab, otherSite);
   const { data } = await enableTab(chatTab);
 
   const response = await send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, { tabId: chatTab, gainPercent: 175, expectedOperationId: data.operationId });
   assert.equal(response.ok, true);
 
   const pages = await savedVolumes();
-  assert.equal(pages[chatgpt], 175, 'the ChatGPT page updated');
+  assert.equal(pages[otherSite], 175, 'the page that was committed updated');
   assert.equal(pages[rezka], 150, 'the saved Rezka row was NOT modified');
 
   // The SAVED_PAGES_CHANGED broadcast reflects the authoritative map: Rezka
-  // unchanged, ChatGPT updated.
+  // unchanged, the committed page updated.
   const last = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED).slice(-1)[0];
   assert.equal(last.payload.savedPages[rezka].volumePercent, 150);
-  assert.equal(last.payload.savedPages[chatgpt].volumePercent, 175);
+  assert.equal(last.payload.savedPages[otherSite].volumePercent, 175);
 });
 
 test('sync #11: an unsaved page can be temporarily boosted to 155% - live gain works, no savedPages entry is created, and PERSIST is a rejected no-op', async () => {

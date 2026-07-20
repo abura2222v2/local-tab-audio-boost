@@ -34,7 +34,7 @@
 /*
  * The `hidden` attribute is the single authoritative visibility state for the
  * empty-state note and the "Clear all" confirmation. Author rules like
- * `.options__clear-confirm { display: flex }` below would otherwise override
+ * `.options__confirm { display: flex }` below would otherwise override
  * the browser's default `[hidden] { display: none }` and leave the
  * confirmation permanently on screen, so this makes the hide win with
  * `!important`. No `[hidden]` state may set a visible `display`.
@@ -104,11 +104,28 @@ h1 {
   outline-offset: 2px;
 }
 
-.options__error {
-  color: var(--error);
+/*
+ * Shared status line. The reserved min-height stops the page from jumping as
+ * transient messages appear and clear themselves.
+ */
+.options__status-line {
   font-size: 13px;
   min-height: 16px;
   margin: 8px 0 0;
+  color: var(--muted);
+}
+
+/* Errors are marked by a leading glyph as well as color, never color alone. */
+.options__status-line--error {
+  color: var(--error);
+}
+
+.options__status-line--error::before {
+  content: '⚠ ';
+}
+
+.options__status-line--success::before {
+  content: '✓ ';
 }
 
 .options__list {
@@ -331,15 +348,25 @@ h1 {
   outline-offset: 2px;
 }
 
-/* --- Danger zone --- */
+/* --- Destructive actions (collapsed by default) --- */
 
-.options__danger {
+.options__destructive {
   margin-top: 28px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
 }
 
-.options__danger-heading {
-  font-size: 14px;
-  margin: 0 0 8px;
+.options__destructive-summary {
+  font-size: 13px;
+  color: var(--error);
+  cursor: pointer;
+  /* Keyboard focus must be visible on the native disclosure control. */
+  padding: 4px 2px;
+  border-radius: 6px;
+  width: fit-content;
+}
+
+.options__destructive-summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
