@@ -23,7 +23,8 @@ In particular:
 ## The page audio engine
 
 Fullscreen-compatible mode injects a small script into the page you are on,
-only after you press **Enable boosting**. That script:
+either when you press **Enable boosting** or automatically when a page whose
+volume you have saved finishes loading. That script:
 
 - is a packaged file shipped inside the extension — never downloaded, and never
   generated from a string;
@@ -49,7 +50,9 @@ trusted extension contexts. For each page you choose to save:
 
 Nothing else is persisted. The search text you type and which rows you have
 checked exist only while the Saved pages view is open and are never written to
-storage. Whether a tab is currently boosting is in-memory state only.
+storage. Whether a tab is currently boosting is in-memory state only — when you
+reopen a saved page, its saved volume is reapplied from `chrome.storage.local`,
+not from any record of it having been "on."
 
 Exact URLs can contain sensitive query parameters, fragments, or identifiers.
 They are never transmitted, but they are stored in plain text locally — see

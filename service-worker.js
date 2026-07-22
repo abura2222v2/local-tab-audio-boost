@@ -2013,10 +2013,53 @@ async function handleFullNavigation(details) {
   // A top-level navigation invalidates every frame record for the tab.
   pageAudioFrames.invalidateTab(details.tabId);
   const entry = sessions.get(details.tabId);
-  if (!entry) return;
+  if (!entry) {
+    // No live session on this tab. If the page that just committed is one
+    // the user saved a preferred volume for, re-apply that boost
+    // automatically - this is what makes a saved page resume its volume
+    // after a browser/PC restart, a plain reload, or being opened in a new
+    // tab, without any popup interaction.
+    await maybeAutoResumeSavedPage(details.tabId, details.url);
+    return;
+  }
   await requestOffscreenTeardown(details.tabId, {
     operationId: entry.operationId,
     reason: SESSION_STOP_REASONS.FULL_NAVIGATION,
+  });
+}
+
+/**
+ * Auto-resume for a freshly-committed top-level page: if the tab has no live
+ * session and its exact URL matches a saved page, start the page-audio
+ * backend at the saved volume. Only the page-audio (fullscreen-compatible)
+ * backend can be resumed this way - tab capture requires a genuine user
+ * gesture on every call and is deliberately never started here.
+ *
+ * Every failure is swallowed: a saved page whose media cannot be routed
+ * (cross-origin without CORS, DRM, an inaccessible frame) must fail exactly
+ * as silently as it would have if the user had never opened the popup. The
+ * URL is only ever matched against locally saved pages via the single
+ * canonical matcher; it is never transmitted or stored here.
+ */
+async function maybeAutoResumeSavedPage(tabId, url) {
+  // Never fight an in-flight or already-live session on this tab.
+  if (sessions.has(tabId)) return;
+  if (typeof url !== 'string' || url === '') return;
+
+  const result = canonicalizePageKey(url);
+  if (!result.ok) return;
+
+  const savedPages = await settingsStore.getSavedPages();
+  const savedRecord = savedPages[result.pageKey];
+  if (!savedRecord) return;
+
+  // A navigation could have superseded this one while we read storage.
+  if (sessions.has(tabId)) return;
+
+  await handleStartPageAudio({
+    tabId,
+    expectedPageKey: result.pageKey,
+    initialGainPercent: savedRecord.volumePercent,
   });
 }
 

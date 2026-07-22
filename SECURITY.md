@@ -48,15 +48,28 @@ URLs embed secrets you would not want stored in plain text locally.
 
 ## Permissions
 
-The extension requests exactly five permissions — `activeTab`, `tabCapture`,
-`offscreen`, `storage`, and `webNavigation` — and no host permissions, content
-scripts, or `externally_connectable`. See the README for what each one is for.
+The extension requests six permissions — `activeTab`, `tabCapture`,
+`offscreen`, `storage`, `webNavigation`, and `scripting` — plus
+`host_permissions` for `http://*/*` and `https://*/*`, and no content scripts
+or `externally_connectable`. See the README for what each one is for.
+
+`host_permissions` is what lets a saved page resume its boost automatically:
+when a top-level page finishes loading, the extension canonicalizes its URL
+and checks it against the pages you have saved locally, and — only on an exact
+match — injects the packaged audio engine to reapply your saved volume. This
+necessarily relaxes the previous "a tab's URL is never read until it is already
+boosting" property: a committed top-level URL is now read to be matched against
+local storage. It is matched only through the single canonical matcher in
+`shared/urls.js`, is never transmitted, logged, or stored by the match itself,
+and a URL that does not match a saved page is used for nothing further.
 
 `webNavigation` can in principle deliver navigation events for tabs across the
 whole browser. Every navigation listener here returns immediately for subframe
-events, and then checks whether the event's tab is one this extension is
-actually boosting **before reading the event's URL**. The URL of an event for
-an unrelated tab is therefore never read, logged, stored, or analyzed.
+events. For a top-level event, the URL is read only to (a) tear down a session
+this extension is already running on that tab, or (b) match it against your
+locally saved pages for auto-resume; it is never transmitted, logged, or
+stored, and an event for a page that is neither boosting nor saved leads to no
+further action.
 
 ## Verifying this yourself
 

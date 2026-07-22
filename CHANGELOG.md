@@ -2,6 +2,19 @@
 
 User-visible changes only.
 
+## 0.4.0
+
+- Saved pages now **resume their boost automatically**. When you reopen, reload,
+  or restore a page whose volume you saved — including after a browser or PC
+  restart — its volume is reapplied on its own, with no need to open the popup
+  or move the slider.
+- Auto-resume uses the fullscreen-compatible engine only. A saved page that can
+  only be boosted in compatibility mode still needs one manual click after a
+  restart, because Chrome requires a user gesture for tab capture every time.
+- Adds host access (`http://*/*`, `https://*/*`), used only to detect when a
+  saved page loads and reapply its volume locally. No page URL is ever
+  transmitted.
+
 ## 0.3.0
 
 - Boosting now uses a **fullscreen-compatible** engine by default: the player's

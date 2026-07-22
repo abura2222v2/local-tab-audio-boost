@@ -5692,6 +5692,60 @@ test('page-audio #28: navigation invalidates the page-audio session and its fram
   assert.equal(tabCaptureCalls, 0, 'navigation handling never involved capture');
 });
 
+test('auto-resume: a saved page reapplies its volume automatically when it loads, with no popup action', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/saved-episode';
+  // A fresh worker after a browser/PC restart: the volume preference is in
+  // storage, but no in-memory session exists and the popup was never opened.
+  await addAndAssertSaved(pageKey, 180);
+  setTab(tabId, pageKey, 'Saved Episode');
+
+  // The tab finishes loading the saved URL - the only trigger.
+  await fireCommitted(tabId, pageKey);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active', 'the saved page resumed boosting on its own');
+  assert.equal(state.data.backend, 'page-audio', 'auto-resume uses the fullscreen-compatible backend');
+  assert.equal(pageGainFor(tabId), 180, 'the page controller received the saved volume');
+  assert.equal(tabCaptureCalls, 0, 'auto-resume never touches tab capture');
+  assert.equal(createDocumentCallCount, 0, 'auto-resume never creates an offscreen document');
+});
+
+test('auto-resume: a page the user never saved is never boosted on its own', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/not-saved';
+  setTab(tabId, pageKey);
+
+  await fireCommitted(tabId, pageKey);
+  await tick(20);
+
+  assert.equal(executeScriptCalls.length, 0, 'nothing was injected for an unsaved page');
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.notEqual(state.data.state, 'active', 'an unsaved page stays inactive');
+  assert.equal(tabCaptureCalls, 0);
+});
+
+test('auto-resume: a saved page whose media cannot be routed fails silently, starting nothing', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/drm-saved';
+  await addAndAssertSaved(pageKey, 200);
+  setTab(tabId, pageKey);
+  setPageMediaState(tabId, 'UNSUPPORTED_MEDIA');
+
+  // Must not throw out of the navigation listener, and must leave no session.
+  await fireCommitted(tabId, pageKey);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.notEqual(state.data.state, 'active', 'an unsupported saved page is left inactive');
+  assert.equal(tabCaptureCalls, 0, 'a failed auto-resume never falls back to capture');
+  assert.equal(createDocumentCallCount, 0);
+});
+
 test('page-audio #29: Disable returns the page gain to 1.0 without tearing down playback', async () => {
   resetEverything();
   const tabId = freshTabId();

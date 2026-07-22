@@ -1,16 +1,19 @@
 # Local Tab Audio Boost
 
 A local Chrome (Manifest V3) extension that adjusts the audio gain of the tab
-you're currently viewing, from 0% to 300%. You can optionally save a preferred
-volume for an **exact page URL**, so that page opens at your chosen level next
-time. Nothing is ever captured automatically: boosting always starts from an
-explicit action you take, and the extension makes no network requests at all.
+you're currently viewing, from 0% to 300%. You can save a preferred volume for
+an **exact page URL**, and that page automatically resumes your chosen level
+whenever you reopen it — including after a browser or PC restart — using the
+fullscreen-compatible engine. The extension makes no network requests at all.
 
 ## Features
 
 - 0%–300% gain on the current tab (100% is unmodified audio).
 - Temporary boosting on any supported page, without saving it first.
 - Saved volume preferences scoped to one **exact** URL, never a whole site.
+- Automatic resume: a saved page reapplies its volume when you reopen it,
+  reload it, or restore it after a browser/PC restart — no click needed
+  (fullscreen-compatible engine only).
 - Saved pages view with local search and bulk management.
 - Local page-title snapshots, captured only when you press **Add this page**.
 - Optional custom names for saved pages.
@@ -65,8 +68,9 @@ This extension is not published to the Chrome Web Store; load it unpacked.
 small audio engine into the page and routes the player's own media through a
 gain node. Because no tab capture is involved, the page's fullscreen button and
 double-click keep working normally, and Chrome shows no capture indicator.
-Injection happens only after you press Enable, uses packaged files from the
-extension, and never reads or sends page content.
+Injection happens when you press Enable, or automatically when a page you have
+saved finishes loading; it uses packaged files from the extension, and never
+reads or sends page content.
 
 Some players cannot be used this way — audio served cross-origin without CORS,
 DRM-protected media, and players inside frames the extension cannot reach. In
@@ -119,10 +123,11 @@ will need to save the new address.
 | `tabCapture` | Capture that tab's audio without injecting a content script |
 | `offscreen` | Host the `AudioContext` that applies the gain (service workers have no DOM) |
 | `storage` | Store saved pages and their preferences locally |
-| `webNavigation` | Detect navigation, including same-document route changes, so boosting stops immediately |
-| `scripting` | Inject the page audio engine, only after you press Enable boosting |
+| `webNavigation` | Detect navigation, including same-document route changes, so boosting stops immediately — and detect when a saved page loads, so it can resume its volume |
+| `scripting` | Inject the page audio engine, when you press Enable boosting or when a saved page auto-resumes |
+| `host_permissions` (`http://*/*`, `https://*/*`) | Read a loading tab's URL to check it against your locally saved pages, and inject the audio engine to resume the saved volume — without waiting for a click. The URL is only matched locally and never transmitted |
 
-No host permissions, no content scripts, and no `externally_connectable`.
+No content scripts and no `externally_connectable`.
 
 ## Development
 
@@ -139,8 +144,10 @@ the extension in Chrome.
 
 ## Known limitations
 
-- Capture starts only after an explicit user action, every time — Chrome
-  requires this and the extension does not work around it.
+- Auto-resume uses the fullscreen-compatible engine only. **Compatibility
+  mode cannot auto-resume**: Chrome requires a genuine user gesture for every
+  tab-capture call, so a saved page that only works in compatibility mode
+  still needs one manual **Use compatibility mode** click after a restart.
 - Protected or DRM-controlled media may not be capturable, and cannot use
   fullscreen-compatible mode at all.
 - Players whose audio is cross-origin without CORS, or that live in an
@@ -150,8 +157,8 @@ the extension in Chrome.
 - Restricted pages (`chrome://`, the Chrome Web Store, and similar) cannot be
   captured.
 - A saved preference stops matching if the page's URL changes.
-- Navigation, closing the tab, or reloading the extension ends an active
-  session; there is no automatic resume.
+- A page you never saved is never boosted on its own — auto-resume applies
+  only to exact URLs you have saved.
 
 ## License
 

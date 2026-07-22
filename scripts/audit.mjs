@@ -20,7 +20,10 @@ function walk(relPath) {
   if (!existsSync(abs)) return [];
   const stat = statSync(abs);
   if (stat.isFile()) {
-    return RUNTIME_EXTENSIONS.has(path.extname(abs)) ? [relPath] : [];
+    // Emit POSIX-style relative paths so every `file === 'shared/urls.js'`
+    // comparison below holds on Windows too, where path.join yields
+    // backslashes (git ls-files, used in the hygiene checks, already does).
+    return RUNTIME_EXTENSIONS.has(path.extname(abs)) ? [relPath.split(path.sep).join('/')] : [];
   }
   const results = [];
   for (const entry of readdirSync(abs)) {
@@ -60,7 +63,23 @@ if (!permissionsMatch) {
   );
 }
 
-const forbiddenManifestKeys = ['host_permissions', 'optional_host_permissions', 'content_scripts', 'externally_connectable'];
+// host_permissions is required so a saved page can auto-resume its boost when
+// reopened/restored without a popup interaction (activeTab only grants access
+// right after an explicit click, which a background/restored tab never has).
+// It is pinned to an exact value here so the scope can never silently widen.
+const expectedHostPermissions = ['http://*/*', 'https://*/*'];
+const actualHostPermissions = Array.isArray(manifest.host_permissions) ? manifest.host_permissions : [];
+const hostPermissionsMatch =
+  actualHostPermissions.length === expectedHostPermissions.length &&
+  expectedHostPermissions.every((p) => actualHostPermissions.includes(p));
+if (!hostPermissionsMatch) {
+  fail(
+    'manifest-host-permissions',
+    `host_permissions must be exactly ${JSON.stringify(expectedHostPermissions)}, found ${JSON.stringify(actualHostPermissions)}`
+  );
+}
+
+const forbiddenManifestKeys = ['optional_host_permissions', 'content_scripts', 'externally_connectable'];
 for (const key of forbiddenManifestKeys) {
   if (key in manifest) fail('manifest-forbidden-key', `manifest.json must not contain "${key}"`);
 }
