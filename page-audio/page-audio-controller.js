@@ -213,13 +213,20 @@
   /**
    * One MutationObserver for the whole document - never one per element, and
    * never a polling interval. Players that create their <video> late, swap it
-   * out, or change source are all covered by re-scanning added subtrees.
+   * out, or assign a source after the element exists are all covered.
    */
   function ensureObserver() {
     if (observer || disposed) return;
     if (typeof MutationObserver !== 'function') return;
     observer = new MutationObserver((records) => {
       for (const record of records) {
+        if (record.type === 'attributes') {
+          // `video.src = ...` and updates to a nested <source src="..."> do
+          // not add a media element to the DOM. Re-scan to retry elements that
+          // were previously waiting for a source, without touching unsafe ones.
+          scanDocument(document);
+          continue;
+        }
         const added = record.addedNodes || [];
         for (const node of added) {
           if (!node) continue;
@@ -228,7 +235,12 @@
         }
       }
     });
-    observer.observe(document.documentElement || document, { childList: true, subtree: true });
+    observer.observe(document.documentElement || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src'],
+    });
   }
 
   function disconnectObserver() {

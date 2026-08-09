@@ -2067,7 +2067,13 @@ async function handleSameDocumentNavigation(details) {
   if (details.frameId !== 0) return;
   await ensureReconciled();
   const entry = sessions.get(details.tabId);
-  if (!entry) return;
+  // A saved SPA route or fragment can become current without a full document
+  // commit. Treat it like the full-navigation auto-resume path so exact-page
+  // preferences work consistently for both kinds of navigation.
+  if (!entry) {
+    await maybeAutoResumeSavedPage(details.tabId, details.url);
+    return;
+  }
   // Same-document route changes keep the document (and therefore the page
   // controller) alive, so frame records survive here - only a genuine exact
   // pageKey change below tears the session down.
@@ -2075,10 +2081,17 @@ async function handleSameDocumentNavigation(details) {
     const result = canonicalizePageKey(details.url);
     if (result.ok && result.pageKey === entry.pageKey) return;
   }
-  await requestOffscreenTeardown(details.tabId, {
+  const teardown = await requestOffscreenTeardown(details.tabId, {
     operationId: entry.operationId,
     reason: SESSION_STOP_REASONS.SAME_DOCUMENT_PAGE_CHANGED,
   });
+
+  // Only resume after the old exact-page session has been positively removed.
+  // If teardown failed, leaving its state alone is safer than starting a
+  // second operation over an ambiguous live backend.
+  if (teardown.ok) {
+    await maybeAutoResumeSavedPage(details.tabId, details.url);
+  }
 }
 
 async function handleTabRemoved(tabId) {

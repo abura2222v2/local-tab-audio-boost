@@ -36,6 +36,7 @@ function createHarness({ origin = 'https://example.com', contextState = 'running
   const results = [];
   let mediaElements = [];
   let observerCallback = null;
+  let observerOptions = null;
 
   class FakeGainNode {
     constructor() {
@@ -87,8 +88,9 @@ function createHarness({ origin = 'https://example.com', contextState = 'running
       created.observers += 1;
       observerCallback = callback;
     }
-    observe() {
+    observe(_target, options) {
       this.observing = true;
+      observerOptions = options;
     }
     disconnect() {
       this.observing = false;
@@ -176,8 +178,12 @@ function createHarness({ origin = 'https://example.com', contextState = 'running
       mediaElements = [...mediaElements, element];
       if (observerCallback) observerCallback([{ addedNodes: [element] }]);
     },
+    notifySourceChanged: () => {
+      if (observerCallback) observerCallback([{ type: 'attributes' }]);
+    },
     controller: () => window[CONTROLLER_GLOBAL],
     hasObserver: () => observerCallback !== null,
+    observerOptions: () => observerOptions,
   };
 }
 
@@ -259,6 +265,23 @@ test('controller #12: a dynamically inserted element is attached through the sin
   const after = h.send({ type: 'QUERY_STATE', operationToken: TOKEN });
   assert.equal(after.state, 'ACTIVE_WITH_MEDIA', 'the late element was picked up');
   assert.equal(h.created.observers, 1, 'still only one observer');
+  assert.equal(h.created.sources.length, 1);
+});
+
+test('controller: a pre-existing media element is attached when its source is assigned later', () => {
+  const h = createHarness();
+  const video = createFakeMediaElement();
+  h.setMedia([video]);
+  h.load();
+  const armed = h.send({ type: 'INSTALL', operationToken: TOKEN, gainPercent: 180 });
+  assert.equal(armed.state, 'ARMED_WAITING_FOR_MEDIA');
+  assert.equal(Array.from(h.observerOptions().attributeFilter).join(','), 'src');
+
+  video.currentSrc = 'https://example.com/late-assigned.mp4';
+  h.notifySourceChanged();
+
+  const after = h.send({ type: 'QUERY_STATE', operationToken: TOKEN });
+  assert.equal(after.state, 'ACTIVE_WITH_MEDIA');
   assert.equal(h.created.sources.length, 1);
 });
 

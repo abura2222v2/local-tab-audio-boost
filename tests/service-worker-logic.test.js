@@ -5728,6 +5728,46 @@ test('auto-resume: a page the user never saved is never boosted on its own', asy
   assert.equal(tabCaptureCalls, 0);
 });
 
+test('auto-resume: a saved SPA route resumes when history navigation reaches its exact URL', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/spa/episode-2';
+  await addAndAssertSaved(pageKey, 180);
+  setTab(tabId, pageKey, 'Episode 2');
+
+  // A History API navigation has no new document commit, but it still opens
+  // the exact saved page and must receive the same local preference.
+  await fireHistoryStateUpdated(tabId, pageKey);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active');
+  assert.equal(state.data.backend, 'page-audio');
+  assert.equal(pageGainFor(tabId), 180);
+  assert.equal(tabCaptureCalls, 0, 'SPA auto-resume never uses tab capture');
+});
+
+test('auto-resume: moving between saved SPA routes replaces the old exact-page session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://player.example/spa/episode-1';
+  const pageB = 'https://player.example/spa/episode-2';
+  await addAndAssertSaved(pageA, 130);
+  await addAndAssertSaved(pageB, 210);
+  setTab(tabId, pageA, 'Episode 1');
+  await enablePageAudio(tabId, 130);
+
+  setTab(tabId, pageB, 'Episode 2');
+  await fireHistoryStateUpdated(tabId, pageB);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active');
+  assert.equal(state.data.backend, 'page-audio');
+  assert.equal(pageGainFor(tabId), 210, 'the new saved route receives its own preference');
+  assert.equal(tabCaptureCalls, 0);
+});
+
 test('auto-resume: a saved page whose media cannot be routed fails silently, starting nothing', async () => {
   resetEverything();
   const tabId = freshTabId();
