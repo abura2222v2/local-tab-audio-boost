@@ -70,6 +70,19 @@ export function tokenizeQuery(query) {
 }
 
 /**
+ * Memoizes buildSearchableText's result per record object: URL parsing plus
+ * NFKC normalization is real work, and options.js recomputes it on every
+ * keystroke in the search box for every saved page even though `savedPages`
+ * (and therefore each individual record) does not change while the user is
+ * simply typing a query. Keyed by the record object's identity (a WeakMap
+ * needs no manual eviction - an entry vanishes with its record), with the
+ * pageKey re-checked on hit as a defense-in-depth guard against a record
+ * object ever being reused for a different key. A cache miss (new/changed
+ * record, e.g. after rename or a volume update) transparently recomputes.
+ */
+const searchableTextCache = new WeakMap();
+
+/**
  * The combined, normalized searchable text for one saved page. Deliberately
  * includes BOTH the raw pageKey and a safely percent-decoded form of it, plus
  * the URL's structural parts broken out, so a token can match text that only
@@ -80,6 +93,17 @@ export function tokenizeQuery(query) {
  * and fragment.
  */
 export function buildSearchableText(pageKey, record) {
+  const cacheable = record !== null && typeof record === 'object';
+  if (cacheable) {
+    const cached = searchableTextCache.get(record);
+    if (cached && cached.pageKey === pageKey) return cached.text;
+  }
+  const text = computeSearchableText(pageKey, record);
+  if (cacheable) searchableTextCache.set(record, { pageKey, text });
+  return text;
+}
+
+function computeSearchableText(pageKey, record) {
   const parts = [];
   const push = (value) => {
     if (typeof value === 'string' && value.length > 0) parts.push(value);

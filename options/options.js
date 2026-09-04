@@ -362,11 +362,24 @@ async function removePage(pageKey) {
 // Toolbar wiring
 // ---------------------------------------------------------------------------
 
+// Debounced: filtering + a full list rebuild on every single keystroke is
+// wasted work while the user is still typing a multi-character query. The
+// visible query updates and re-renders SEARCH_DEBOUNCE_MS after the last
+// keystroke, not on each one - a fast, uninterrupted burst of typing (the
+// common case) produces exactly one render instead of one per character.
+const SEARCH_DEBOUNCE_MS = 120;
+let searchDebounceTimer = null;
+
 els.search.addEventListener('input', () => {
   // Selection intentionally survives a query change - the counts report how
   // much of it is currently hidden.
-  searchQuery = els.search.value;
-  render();
+  const value = els.search.value;
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    searchDebounceTimer = null;
+    searchQuery = value;
+    render();
+  }, SEARCH_DEBOUNCE_MS);
 });
 
 els.selectAllVisible.addEventListener('change', () => {
