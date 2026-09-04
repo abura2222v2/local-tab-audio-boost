@@ -1080,11 +1080,17 @@ async function applyConfirmedGainToSession(tabId, operationId, clamped) {
 }
 
 async function propagateGainToSessionsSharingPageKey(pageKey, clamped) {
-  for (const [otherTabId, otherEntry] of sessions) {
-    if (otherEntry.pageKey === pageKey && otherEntry.state === 'active') {
-      await applyConfirmedGainToSession(otherTabId, otherEntry.operationId, clamped);
-    }
-  }
+  // Snapshotted first (mirroring stopSnapshotSessions below) so concurrent
+  // application never iterates `sessions` while it is being mutated, then
+  // applied to every matching tabId in parallel: each target is a distinct
+  // tabId, so their offscreen/page-audio round trips and cache updates never
+  // touch one another's state.
+  const snapshot = [...sessions.entries()].filter(
+    ([, entry]) => entry.pageKey === pageKey && entry.state === 'active'
+  );
+  await Promise.all(
+    snapshot.map(([otherTabId, otherEntry]) => applyConfirmedGainToSession(otherTabId, otherEntry.operationId, clamped))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,11 +1195,16 @@ async function handleAddPageManual({ rawUrl, gainPercent, customName }) {
  */
 async function stopSnapshotSessions(predicate, reason) {
   const snapshot = [...sessions.entries()].filter(([, entry]) => predicate(entry));
-  for (const [tabId, entry] of snapshot) {
-    const result = await requestOffscreenTeardown(tabId, { operationId: entry.operationId, reason });
-    if (!result.ok) return result;
-  }
-  return { ok: true };
+  // Every snapshotted session is a distinct tabId, so their teardowns are
+  // independent and safe to run concurrently (requestOffscreenTeardown never
+  // touches any tabId's cache entry other than its own). Every teardown is
+  // still attempted even if an earlier one (by snapshot order) fails - the
+  // first failure is what gets reported, but a slow or failing stop for one
+  // tab no longer blocks - or gets skipped ahead of - the rest.
+  const results = await Promise.all(
+    snapshot.map(([tabId, entry]) => requestOffscreenTeardown(tabId, { operationId: entry.operationId, reason }))
+  );
+  return results.find((result) => !result.ok) ?? { ok: true };
 }
 
 /**
@@ -1250,13 +1261,17 @@ async function handleRemoveSavedPage({ pageKey }) {
  */
 async function handleDeleteSelectedSavedPages({ pageKeys }) {
   await ensureReconciled();
-  const results = [];
+  // Each pageKey is an exact, distinct page - no two selected pageKeys can
+  // ever share a live session's tabId (a session's pageKey is immutable and
+  // unique to its tab) - so deleting them is embarrassingly parallel. Storage
+  // writes still serialize correctly through settingsStore's own mutation
+  // queue regardless of the order these settle in.
+  const outcomes = await Promise.all(pageKeys.map((pageKey) => deleteOneSavedPage(pageKey)));
   let anyDeleted = false;
-  for (const pageKey of pageKeys) {
-    const result = await deleteOneSavedPage(pageKey);
+  const results = outcomes.map((result) => {
     if (result.ok) anyDeleted = true;
-    results.push(result.ok ? { pageKey, ok: true } : { pageKey, ok: false, error: result.error });
-  }
+    return result.ok ? { pageKey: result.pageKey, ok: true } : { pageKey: result.pageKey, ok: false, error: result.error };
+  });
   if (anyDeleted) {
     broadcastSavedPagesChanged();
     for (const result of results) {
@@ -1312,12 +1327,13 @@ async function resetOneSavedPageTo100(pageKey) {
  */
 async function handleResetSelectedSavedPagesTo100({ pageKeys }) {
   await ensureReconciled();
-  const results = [];
+  // Same independence argument as handleDeleteSelectedSavedPages: distinct
+  // exact pageKeys can never share a session's tabId, so resetting them is
+  // safe to run concurrently.
+  const results = await Promise.all(pageKeys.map((pageKey) => resetOneSavedPageTo100(pageKey)));
   let anyChanged = false;
-  for (const pageKey of pageKeys) {
-    const result = await resetOneSavedPageTo100(pageKey);
+  for (const result of results) {
     if (result.ok) anyChanged = true;
-    results.push(result);
   }
   if (anyChanged) {
     broadcastSavedPagesChanged();
@@ -1559,31 +1575,38 @@ async function injectPageAudioIntoFrame(tabId, frameId) {
  */
 async function activatePageAudio(tabId, operationToken, gainPercent) {
   const frames = await listInjectableFrames(tabId);
-  const results = [];
-  let inaccessibleFrames = 0;
 
-  for (const { frameId, documentId } of frames) {
-    const injected = await injectPageAudioIntoFrame(tabId, frameId);
-    if (!injected.ok) {
-      inaccessibleFrames += 1;
-      continue;
-    }
-    const response = await sendPageAudioCommand(tabId, frameId, {
-      type: BRIDGE_COMMANDS.INSTALL,
-      operationToken,
-      gainPercent,
-    });
-    if (!response.ok || !response.data) continue;
+  // Every frame is injected and installed independently - a page with
+  // several iframes (ads, a separate player frame, etc.) no longer pays for
+  // each frame's injectScript + INSTALL round trip one at a time. Each task
+  // only ever touches its own frameId's record in pageAudioFrames, which is
+  // keyed per (tabId, frameId) and safe to write from concurrent tasks (see
+  // shared/page-audio-session.js).
+  const perFrameOutcomes = await Promise.all(
+    frames.map(async ({ frameId, documentId }) => {
+      const injected = await injectPageAudioIntoFrame(tabId, frameId);
+      if (!injected.ok) return { inaccessible: true };
 
-    const data = response.data;
-    pageAudioFrames.setFrame(tabId, frameId, {
-      documentId,
-      operationToken,
-      state: data.state,
-      gainPercent,
-    });
-    results.push({ frameId, state: data.state, refusals: data.refusals ?? [] });
-  }
+      const response = await sendPageAudioCommand(tabId, frameId, {
+        type: BRIDGE_COMMANDS.INSTALL,
+        operationToken,
+        gainPercent,
+      });
+      if (!response.ok || !response.data) return { inaccessible: false };
+
+      const data = response.data;
+      pageAudioFrames.setFrame(tabId, frameId, {
+        documentId,
+        operationToken,
+        state: data.state,
+        gainPercent,
+      });
+      return { frameId, state: data.state, refusals: data.refusals ?? [] };
+    })
+  );
+
+  const inaccessibleFrames = perFrameOutcomes.filter((outcome) => outcome.inaccessible === true).length;
+  const results = perFrameOutcomes.filter((outcome) => outcome.frameId !== undefined);
 
   if (results.length === 0) {
     return {
@@ -1613,22 +1636,24 @@ async function activatePageAudio(tabId, operationToken, gainPercent) {
 /** Applies a confirmed gain to every live frame of a page-audio session. */
 async function setPageAudioGain(tabId, operationToken, gainPercent) {
   const frames = pageAudioFrames.listFramesForOperation(tabId, operationToken);
-  let anyConfirmed = false;
-  for (const frame of frames) {
-    const response = await sendPageAudioCommand(tabId, frame.frameId, {
-      type: BRIDGE_COMMANDS.SET_GAIN,
-      operationToken,
-      gainPercent,
-    });
-    if (response.ok && response.data && !response.data.rejected) {
-      pageAudioFrames.updateFrameState(tabId, frame.frameId, operationToken, {
+  const confirmations = await Promise.all(
+    frames.map(async (frame) => {
+      const response = await sendPageAudioCommand(tabId, frame.frameId, {
+        type: BRIDGE_COMMANDS.SET_GAIN,
+        operationToken,
         gainPercent,
-        state: response.data.state,
       });
-      anyConfirmed = true;
-    }
-  }
-  return anyConfirmed;
+      if (response.ok && response.data && !response.data.rejected) {
+        pageAudioFrames.updateFrameState(tabId, frame.frameId, operationToken, {
+          gainPercent,
+          state: response.data.state,
+        });
+        return true;
+      }
+      return false;
+    })
+  );
+  return confirmations.some(Boolean);
 }
 
 /**
@@ -1643,11 +1668,16 @@ async function setPageAudioGain(tabId, operationToken, gainPercent) {
  */
 async function deactivatePageAudio(tabId, operationToken) {
   const frames = pageAudioFrames.listFramesForOperation(tabId, operationToken);
-  for (const frame of frames) {
-    await sendPageAudioCommand(tabId, frame.frameId, { type: BRIDGE_COMMANDS.RESET_TO_NEUTRAL, operationToken });
-    await sendPageAudioCommand(tabId, frame.frameId, { type: BRIDGE_COMMANDS.DISPOSE_OBSERVERS, operationToken });
-    pageAudioFrames.removeFrame(tabId, frame.frameId);
-  }
+  // Per-frame order (reset before disposing that same frame's observer) is
+  // preserved within each frame's own task; frames themselves are independent
+  // and torn down concurrently.
+  await Promise.all(
+    frames.map(async (frame) => {
+      await sendPageAudioCommand(tabId, frame.frameId, { type: BRIDGE_COMMANDS.RESET_TO_NEUTRAL, operationToken });
+      await sendPageAudioCommand(tabId, frame.frameId, { type: BRIDGE_COMMANDS.DISPOSE_OBSERVERS, operationToken });
+      pageAudioFrames.removeFrame(tabId, frame.frameId);
+    })
+  );
   return { ok: true };
 }
 
