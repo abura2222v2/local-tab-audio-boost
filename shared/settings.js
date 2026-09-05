@@ -337,6 +337,38 @@ export function clearSavedPages() {
  *  - { aborted: true, code: 'PAGE_NOT_SAVED' } if the key does not exist in savedPages;
  *  - { aborted: false, pageKey, volumePercent } on a successful update.
  */
+/**
+ * Batch version of persistExistingVolumeIfPreconditionHolds for bulk "Reset
+ * selected to 100%": writes the SAME volumePercent to every given pageKey
+ * that is already saved, in one read-modify-write inside a single
+ * mutation-queue turn, instead of one chrome.storage.local round trip per
+ * page. There is no per-page precondition here (the caller - resetting
+ * every selected page to 100% - has none beyond "still saved"; the
+ * per-tab live-gain confirmation that DOES need a precondition happens
+ * separately, before this is ever called, via applyConfirmedGainToSession).
+ * A pageKey that is not currently saved is simply left out of `updated` -
+ * never resurrected, exactly like the single-page function's PAGE_NOT_SAVED
+ * outcome. Writes storage at most once, and only if at least one given
+ * pageKey actually existed.
+ */
+export function persistVolumesIfSaved(pageKeys, volumePercent) {
+  return enqueueMutation(async () => {
+    const pages = await readSavedPages();
+    const updated = new Set();
+    for (const pageKey of pageKeys) {
+      const existing = pages[pageKey];
+      if (existing) {
+        pages[pageKey] = { ...existing, volumePercent };
+        updated.add(pageKey);
+      }
+    }
+    if (updated.size > 0) {
+      await writeSavedPages(pages);
+    }
+    return { updated };
+  });
+}
+
 export function persistExistingVolumeIfPreconditionHolds(pageKey, volumePercent, precondition) {
   return enqueueMutation(async () => {
     // Re-checked after every asynchronous boundary this turn crosses - the

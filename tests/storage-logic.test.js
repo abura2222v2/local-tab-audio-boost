@@ -269,6 +269,39 @@ test('removeSavedPages: an absent or duplicated key is a harmless no-op for that
   assert.equal(stub.setCalls.length, setCallsBefore + 1, 'no write when nothing in the batch existed');
 });
 
+test('persistVolumesIfSaved: writes the same volume to every already-saved key in one write, skipping unsaved ones', async () => {
+  const stub = installSetPausableChromeStub();
+  await settings.addSavedPage('https://reset-a.example/', 250);
+  await settings.addSavedPage('https://reset-b.example/', 300);
+  await settings.addSavedPage('https://reset-keep.example/', 150);
+
+  const setCallsBefore = stub.setCalls.length;
+  const { updated } = await settings.persistVolumesIfSaved(
+    ['https://reset-a.example/', 'https://reset-b.example/', 'https://reset-missing.example/'],
+    100
+  );
+  assert.deepEqual([...updated].sort(), ['https://reset-a.example/', 'https://reset-b.example/']);
+  assert.equal(stub.setCalls.length, setCallsBefore + 1, 'one write for the whole batch');
+
+  const volumes = await savedVolumes();
+  assert.equal(volumes['https://reset-a.example/'], 100);
+  assert.equal(volumes['https://reset-b.example/'], 100);
+  assert.equal(volumes['https://reset-keep.example/'], 150, 'an unselected page is untouched');
+});
+
+test('persistVolumesIfSaved: a batch matching nothing saved writes nothing', async () => {
+  const stub = installSetPausableChromeStub();
+  await settings.addSavedPage('https://reset-untouched.example/', 200);
+
+  const setCallsBefore = stub.setCalls.length;
+  const { updated } = await settings.persistVolumesIfSaved(['https://reset-nothing.example/'], 100);
+  assert.deepEqual([...updated], []);
+  assert.equal(stub.setCalls.length, setCallsBefore, 'no write when nothing in the batch was saved');
+
+  const volumes = await savedVolumes();
+  assert.equal(volumes['https://reset-untouched.example/'], 200, 'unrelated saved page is untouched');
+});
+
 test('duplicate persist is idempotent', async () => {
   installChromeStub();
   await settings.addSavedPage('https://w.example/', DEFAULT_VOLUME_PERCENT);

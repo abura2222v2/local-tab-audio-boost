@@ -1323,40 +1323,38 @@ async function handleDeleteSelectedSavedPages({ pageKeys }) {
 }
 
 /**
- * Resets ONE selected page's saved volume to 100% (GainNode gain 1.0). This is
- * not a deletion and never stops capture: a page that is currently boosting
- * stays boosting, just at 1.0.
- *
- * For an ACTIVE saved page every matching snapshot session must positively
- * confirm the operation-scoped 100% live update BEFORE the saved preference is
- * committed - if any confirmation fails, 100% is not persisted for that page
- * and a structured failure is returned. An inactive page simply persists.
+ * Phase 1 of resetting one selected page to 100% (GainNode gain 1.0): confirms
+ * the live gain change on every matching ACTIVE session for this exact
+ * pageKey, but deliberately does NOT persist anything yet - persistence for
+ * a whole bulk reset is batched separately (see handleResetSelectedSavedPagesTo100)
+ * so N selected pages cost one storage write instead of N. If any matching
+ * session's live update cannot be confirmed, this page is reported as failed
+ * and is never included in that batched persist - 100% must never be saved
+ * while a page's active tab might still be at some other, unconfirmed gain.
+ * An inactive page (no matching snapshot) has nothing to confirm and is
+ * immediately clear to persist.
  */
-async function resetOneSavedPageTo100(pageKey) {
+async function confirmResetTo100LiveGain(pageKey) {
   const snapshot = [...sessions.entries()].filter(
     ([, entry]) => entry.pageKey === pageKey && entry.state === 'active'
   );
 
-  for (const [tabId, entry] of snapshot) {
-    const confirmed = await applyConfirmedGainToSession(tabId, entry.operationId, DEFAULT_VOLUME_PERCENT);
-    if (!confirmed) {
-      return {
-        pageKey,
-        ok: false,
-        error: { code: ERROR_CODES.CAPTURE_FAILED, message: 'Could not apply 100% to this page’s active tab.' },
-      };
-    }
-    // The row in any open Saved-pages view follows the confirmed live change.
-    broadcastSavedPageLiveGainToOptions(pageKey, DEFAULT_VOLUME_PERCENT);
-  }
-
-  const result = await settingsStore.persistExistingVolumeIfPreconditionHolds(
-    pageKey,
-    DEFAULT_VOLUME_PERCENT,
-    () => true
+  // Distinct tabIds (every entry here shares this pageKey but not a tabId),
+  // so their live-gain confirmations are independent and run concurrently.
+  const confirmations = await Promise.all(
+    snapshot.map(([tabId, entry]) => applyConfirmedGainToSession(tabId, entry.operationId, DEFAULT_VOLUME_PERCENT))
   );
-  if (result.aborted) {
-    return { pageKey, ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
+  if (confirmations.some((confirmed) => !confirmed)) {
+    return {
+      pageKey,
+      ok: false,
+      error: { code: ERROR_CODES.CAPTURE_FAILED, message: 'Could not apply 100% to this page’s active tab.' },
+    };
+  }
+  if (snapshot.length > 0) {
+    // The row in any open Saved-pages view follows the confirmed live
+    // change - one notice per pageKey regardless of how many tabs share it.
+    broadcastSavedPageLiveGainToOptions(pageKey, DEFAULT_VOLUME_PERCENT);
   }
   return { pageKey, ok: true };
 }
@@ -1364,18 +1362,33 @@ async function resetOneSavedPageTo100(pageKey) {
 /**
  * Bulk "Reset selected to 100%". Independent per-page results exactly like
  * bulk delete: a failure for one page never blocks another, and a page whose
- * live update could not be confirmed does not get 100% persisted.
+ * live update could not be confirmed does not get 100% persisted. Live-gain
+ * confirmation runs per pageKey in parallel; the actual storage commit for
+ * every page that is clear to persist happens in a single batched write.
  */
 async function handleResetSelectedSavedPagesTo100({ pageKeys }) {
   await ensureReconciled();
   // Same independence argument as handleDeleteSelectedSavedPages: distinct
-  // exact pageKeys can never share a session's tabId, so resetting them is
-  // safe to run concurrently.
-  const results = await Promise.all(pageKeys.map((pageKey) => resetOneSavedPageTo100(pageKey)));
+  // exact pageKeys can never share a session's tabId, so confirming their
+  // live gain is safe to run concurrently.
+  const liveOutcomes = await Promise.all(pageKeys.map((pageKey) => confirmResetTo100LiveGain(pageKey)));
+
+  const toPersist = liveOutcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.pageKey);
+  const { updated } =
+    toPersist.length > 0
+      ? await settingsStore.persistVolumesIfSaved(toPersist, DEFAULT_VOLUME_PERCENT)
+      : { updated: new Set() };
+
   let anyChanged = false;
-  for (const result of results) {
-    if (result.ok) anyChanged = true;
-  }
+  const results = liveOutcomes.map((outcome) => {
+    if (!outcome.ok) return outcome;
+    if (!updated.has(outcome.pageKey)) {
+      return { pageKey: outcome.pageKey, ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
+    }
+    anyChanged = true;
+    return { pageKey: outcome.pageKey, ok: true };
+  });
+
   if (anyChanged) {
     broadcastSavedPagesChanged();
     for (const result of results) {
