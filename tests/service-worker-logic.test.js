@@ -5477,6 +5477,121 @@ test('bulk: a bulk operation naming a page that is not saved reports it per-page
   assert.equal((await savedVolumes())[realKey], 100);
 });
 
+// --- Import saved pages ---
+
+test('IMPORT_SAVED_PAGES: entries payloads are strictly validated (array, shaped, bounded)', async () => {
+  const { validateMessage } = await import('../shared/validation.js');
+  const base = { target: TARGETS.SERVICE_WORKER, type: MESSAGE_TYPES.IMPORT_SAVED_PAGES, requestId: 'r' };
+  const good = { pageKey: 'https://import-ok.example/' };
+  assert.equal(validateMessage({ ...base, payload: { entries: [good] } }).ok, true, 'a minimal valid entry is accepted');
+  assert.equal(
+    validateMessage({ ...base, payload: { entries: [{ ...good, volumePercent: 150, titleSnapshot: 'T', customName: 'N' }] } })
+      .ok,
+    true,
+    'a fully populated entry is accepted'
+  );
+  assert.equal(validateMessage({ ...base, payload: { entries: [] } }).ok, false, 'empty array rejected');
+  assert.equal(validateMessage({ ...base, payload: { entries: good } }).ok, false, 'non-array rejected');
+  assert.equal(validateMessage({ ...base, payload: {} }).ok, false, 'missing entries rejected');
+  assert.equal(validateMessage({ ...base, payload: { entries: [{}] } }).ok, false, 'an entry with no pageKey rejected');
+  assert.equal(validateMessage({ ...base, payload: { entries: [{ pageKey: '' }] } }).ok, false, 'empty pageKey rejected');
+  assert.equal(
+    validateMessage({ ...base, payload: { entries: [{ pageKey: good.pageKey, volumePercent: 'x' }] } }).ok,
+    false,
+    'non-numeric volumePercent rejected'
+  );
+  assert.equal(
+    validateMessage({
+      ...base,
+      payload: { entries: [{ pageKey: good.pageKey, customName: 'x'.repeat(MAX_CUSTOM_NAME_LENGTH + 1) }] },
+    }).ok,
+    false,
+    'over-length customName rejected'
+  );
+  const oversized = Array.from({ length: MAX_BULK_PAGE_KEYS + 1 }, (_, i) => ({ pageKey: `https://import-bulk.example/${i}` }));
+  assert.equal(validateMessage({ ...base, payload: { entries: oversized } }).ok, false, 'oversized batch rejected');
+  // Unlike bulk pageKeys, a NON-canonical pageKey passes shape validation
+  // here - it is canonicalized, or rejected per-entry, inside the handler.
+  assert.equal(
+    validateMessage({ ...base, payload: { entries: [{ pageKey: 'https://EXAMPLE.com/' }] } }).ok,
+    true,
+    'a non-canonical pageKey still passes shape validation'
+  );
+});
+
+test('IMPORT_SAVED_PAGES: is options-only - the popup sender is rejected', async () => {
+  resetEverything();
+  const pageKey = 'https://import-sender.example/';
+  const response = await send(MESSAGE_TYPES.IMPORT_SAVED_PAGES, { entries: [{ pageKey }] }, DEFAULT_TEST_SENDER);
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.INVALID_MESSAGE);
+  assert.equal(pageKey in (await savedVolumes()), false);
+});
+
+test('IMPORT_SAVED_PAGES: imports valid entries, canonicalizes pageKeys, defaults volume to 100%, and reports a structured per-entry failure for an invalid one without blocking the rest', async () => {
+  resetEverything();
+  const response = await send(
+    MESSAGE_TYPES.IMPORT_SAVED_PAGES,
+    {
+      entries: [
+        { pageKey: 'https://EXAMPLE.com/watch?v=1', volumePercent: 250, titleSnapshot: 'Some Title', customName: 'My Name' },
+        { pageKey: 'https://import-default.example/' }, // no volumePercent -> defaults to 100
+        { pageKey: 'not a url' }, // fails canonicalization
+      ],
+    },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  const results = response.data.results;
+  assert.equal(results.length, 3);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[1].ok, true);
+  assert.equal(results[2].ok, false, 'the malformed entry is reported as failed');
+  assert.ok(results[2].error.code);
+
+  const pages = await savedRecords();
+  const canonicalKey = 'https://example.com/watch?v=1';
+  assert.ok(canonicalKey in pages, 'the pageKey was canonicalized (lowercased host) before storing');
+  assert.equal(pages[canonicalKey].volumePercent, 250);
+  assert.equal(pages[canonicalKey].titleSnapshot, 'Some Title');
+  assert.equal(pages[canonicalKey].customName, 'My Name');
+  assert.equal(pages['https://import-default.example/'].volumePercent, 100, 'a missing volumePercent defaults to 100%');
+  assert.equal('not a url' in pages, false, 'the invalid entry was never stored');
+});
+
+test('IMPORT_SAVED_PAGES: importing an already-saved exact pageKey OVERWRITES its stored record', async () => {
+  resetEverything();
+  const pageKey = 'https://import-overwrite.example/';
+  await addAndAssertSaved(pageKey, 150);
+  await send(MESSAGE_TYPES.RENAME_SAVED_PAGE, { pageKey, customName: 'Old Name' }, OPTIONS_TEST_SENDER);
+
+  const response = await send(
+    MESSAGE_TYPES.IMPORT_SAVED_PAGES,
+    { entries: [{ pageKey, volumePercent: 200, customName: 'New Name' }] },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(response.ok, true);
+  assert.equal(response.data.results[0].ok, true);
+
+  const pages = await savedRecords();
+  assert.equal(pages[pageKey].volumePercent, 200);
+  assert.equal(pages[pageKey].customName, 'New Name');
+});
+
+test('IMPORT_SAVED_PAGES: an unrelated existing saved page is never touched', async () => {
+  resetEverything();
+  const untouchedKey = 'https://import-untouched.example/';
+  await addAndAssertSaved(untouchedKey, 175);
+
+  await send(
+    MESSAGE_TYPES.IMPORT_SAVED_PAGES,
+    { entries: [{ pageKey: 'https://import-new.example/', volumePercent: 250 }] },
+    OPTIONS_TEST_SENDER
+  );
+
+  assert.equal((await savedVolumes())[untouchedKey], 175);
+});
+
 test('GET_SAVED_PAGES returns schema-6 records plus the currently active exact pageKeys', async () => {
   resetEverything();
   const activeTab = freshTabId();

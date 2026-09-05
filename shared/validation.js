@@ -8,6 +8,7 @@ import {
   MAX_GAIN_PERCENT,
   MAX_BULK_PAGE_KEYS,
   MAX_CUSTOM_NAME_LENGTH,
+  MAX_TITLE_SNAPSHOT_LENGTH,
   ERROR_CODES,
   SESSION_STOP_REASONS,
 } from './constants.js';
@@ -138,6 +139,7 @@ const SERVICE_WORKER_PAYLOAD_VALIDATORS = {
   // fully-validated list of canonical exact pageKeys (see isValidPageKeyList).
   [MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100]: (p) => isPlainObject(p) && isValidPageKeyList(p.pageKeys),
   [MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES]: (p) => isPlainObject(p) && isValidPageKeyList(p.pageKeys),
+  [MESSAGE_TYPES.IMPORT_SAVED_PAGES]: (p) => isPlainObject(p) && isValidImportEntriesList(p.entries),
   // START_CAPTURE carries the popup's last server-derived `expectedPageKey`
   // (never trusted as URL authority - only compared against a freshly
   // re-derived pageKey in handleStartCapture) so a click/slider observed on
@@ -305,6 +307,42 @@ export function isValidPageKeyList(value) {
     if (!canonical.ok || canonical.pageKey !== entry) return false;
     if (seen.has(entry)) return false;
     seen.add(entry);
+  }
+  return true;
+}
+
+/**
+ * Validates IMPORT_SAVED_PAGES's `entries` array: saved-page data read from a
+ * local JSON file the user picked (an Export produces exactly this shape).
+ * Deliberately looser than isValidPageKeyList at this layer - an entry's
+ * pageKey is only checked for basic shape here (non-empty string), never
+ * required to already be canonical, since the whole point of import is
+ * accepting arbitrary externally-authored data. The service worker's handler
+ * independently canonicalizes (and can reject) each entry's pageKey through
+ * the single canonical matcher, exactly like ADD_PAGE_MANUAL's rawUrl - a
+ * malformed entry here only ever fails validation on shape (wrong types,
+ * over-length strings, an oversized/empty batch), never on being "not yet
+ * canonical."
+ */
+export function isValidImportEntriesList(value) {
+  if (!Array.isArray(value)) return false;
+  if (value.length === 0 || value.length > MAX_BULK_PAGE_KEYS) return false;
+  for (const entry of value) {
+    if (!isPlainObject(entry)) return false;
+    if (!isNonEmptyString(entry.pageKey)) return false;
+    if (entry.volumePercent !== undefined && typeof entry.volumePercent !== 'number') return false;
+    if (
+      entry.titleSnapshot !== undefined &&
+      (typeof entry.titleSnapshot !== 'string' || entry.titleSnapshot.length > MAX_TITLE_SNAPSHOT_LENGTH)
+    ) {
+      return false;
+    }
+    if (
+      entry.customName !== undefined &&
+      (typeof entry.customName !== 'string' || entry.customName.length > MAX_CUSTOM_NAME_LENGTH)
+    ) {
+      return false;
+    }
   }
   return true;
 }

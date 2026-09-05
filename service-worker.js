@@ -29,7 +29,7 @@ import {
   validatePageContextSender,
 } from './shared/messages.js';
 import { clampGainPercent, isPlainObject, isNonEmptyString, isValidTabId } from './shared/validation.js';
-import { sanitizeTitleSnapshot, sanitizeCustomName } from './shared/saved-page-metadata.js';
+import { sanitizeTitleSnapshot, sanitizeCustomName, createSavedPageRecord } from './shared/saved-page-metadata.js';
 import {
   BACKENDS,
   BRIDGE_COMMANDS,
@@ -1206,6 +1206,53 @@ async function handleAddPageManual({ rawUrl, gainPercent, customName }) {
 }
 
 /**
+ * Bulk-imports saved pages from a local JSON file the options page's Import
+ * button already read and parsed - this handler never fetches, opens, or
+ * visits any of them. Every entry is independently canonicalized (through
+ * the same single canonical matcher every other exact-match decision uses)
+ * and turned into a well-formed schema-6 record; a malformed pageKey or an
+ * out-of-range volume fails ONLY that entry with a structured per-entry
+ * result, exactly like bulk delete/reset - one bad row in an imported file
+ * never blocks the rest. Every entry that resolves cleanly is written in a
+ * single batched storage commit (settingsStore.importSavedPages), and - since
+ * import is an explicit, user-initiated restore rather than a passive
+ * re-save - OVERWRITES any existing record for that exact pageKey, unlike
+ * ADD_PAGE_MANUAL's idempotent-volume behavior.
+ */
+async function handleImportSavedPages({ entries }) {
+  await ensureReconciled();
+  const prepared = entries.map((entry) => {
+    const canonical = canonicalizePageKey(entry.pageKey);
+    if (!canonical.ok) {
+      return { pageKey: entry.pageKey, ok: false, error: { code: canonical.code, message: describeUrlErrorCode(canonical.code) } };
+    }
+    const clamped =
+      entry.volumePercent === undefined ? DEFAULT_VOLUME_PERCENT : (clampGainPercent(entry.volumePercent) ?? DEFAULT_VOLUME_PERCENT);
+    const record = createSavedPageRecord({
+      volumePercent: clamped,
+      titleSnapshot: entry.titleSnapshot,
+      customName: entry.customName,
+    });
+    if (record === null) {
+      // Unreachable in practice (clampGainPercent above already guarantees a
+      // valid volume), kept as defense in depth so this can never silently
+      // import a half-valid record.
+      return { pageKey: canonical.pageKey, ok: false, error: { code: ERROR_CODES.INVALID_MESSAGE, message: 'Invalid saved-page data.' } };
+    }
+    return { pageKey: canonical.pageKey, ok: true, record };
+  });
+
+  const toImport = prepared.filter((entry) => entry.ok).map((entry) => ({ pageKey: entry.pageKey, record: entry.record }));
+  const { imported } = toImport.length > 0 ? await settingsStore.importSavedPages(toImport) : { imported: new Set() };
+
+  const results = prepared.map((entry) =>
+    entry.ok ? { pageKey: entry.pageKey, ok: true } : { pageKey: entry.pageKey, ok: false, error: entry.error }
+  );
+  if (imported.size > 0) broadcastSavedPagesChanged();
+  return { ok: true, data: { results } };
+}
+
+/**
  * Snapshots the currently-cached sessions matching `predicate` ONCE, then
  * stops each through confirmed, operation-scoped teardown. Returns
  * `{ ok: true }` only if every snapshot session was positively confirmed
@@ -1994,6 +2041,8 @@ async function handleMessage(message) {
       return handleAddCurrentPage(message.payload);
     case MESSAGE_TYPES.ADD_PAGE_MANUAL:
       return handleAddPageManual(message.payload);
+    case MESSAGE_TYPES.IMPORT_SAVED_PAGES:
+      return handleImportSavedPages(message.payload);
     case MESSAGE_TYPES.REMOVE_SAVED_PAGE:
       return handleRemoveSavedPage(message.payload);
     case MESSAGE_TYPES.CLEAR_SAVED_PAGES:
@@ -2055,6 +2104,7 @@ const OPTIONS_ONLY_MESSAGE_TYPES = new Set([
   MESSAGE_TYPES.RENAME_SAVED_PAGE,
   MESSAGE_TYPES.RESET_SELECTED_SAVED_PAGES_TO_100,
   MESSAGE_TYPES.DELETE_SELECTED_SAVED_PAGES,
+  MESSAGE_TYPES.IMPORT_SAVED_PAGES,
 ]);
 const OFFSCREEN_ONLY_MESSAGE_TYPES = new Set([MESSAGE_TYPES.SESSION_STOPPED, MESSAGE_TYPES.SESSION_ERROR]);
 

@@ -2,6 +2,17 @@
 
 User-visible changes only.
 
+## 0.5.0
+
+- Added **Export saved pages** and **Import saved pages** to the Saved pages
+  view. Export writes every saved page (its exact URL, volume, title
+  snapshot, and custom name) to a local JSON file. Import reads a local JSON
+  file - this extension's own export, or a hand-edited list with the same
+  shape - and adds its pages; an already-saved exact URL is overwritten with
+  the imported values. Neither ever touches the network: export only reads
+  data already held locally, and import only ever reads a File the browser's
+  own file picker handed to the page.
+
 ## 0.4.0
 
 - Saved pages now **resume their boost automatically**. When you reopen, reload,

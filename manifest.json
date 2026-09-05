@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Tab Audio Boost",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Boost a tab's audio up to 300%. Fully local, no network access. A saved page automatically resumes its preferred volume when you reopen it.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "webNavigation", "scripting"],

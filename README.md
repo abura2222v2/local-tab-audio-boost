@@ -15,6 +15,8 @@ fullscreen-compatible engine. The extension makes no network requests at all.
   reload it, or restore it after a browser/PC restart — no click needed
   (fullscreen-compatible engine only).
 - Saved pages view with local search and bulk management.
+- Export saved pages to a local JSON file, and import them back (or a
+  hand-edited list with the same shape) — fully local, no network access.
 - Local page-title snapshots, captured only when you press **Add this page**.
 - Optional custom names for saved pages.
 - Live synchronization between the popup slider and the Saved pages sliders.
@@ -61,6 +63,11 @@ This extension is not published to the Chrome Web Store; load it unpacked.
 - **Clear all saved pages**, under the collapsed *Delete all saved pages*
   section, removes **every** saved page — including pages hidden by the current
   search and pages that are not selected.
+- **Export saved pages** saves every saved page (URL, volume, title snapshot,
+  and custom name) to a local JSON file. **Import saved pages** reads a local
+  JSON file — this extension's own export, or a hand-edited list with the same
+  shape — and adds its pages; an already-saved exact URL is overwritten with
+  the imported values. Neither ever touches the network.
 
 ## Audio modes
 

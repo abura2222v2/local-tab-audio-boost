@@ -11,13 +11,21 @@
 // shared/saved-page-metadata.js). Selection and the search query are
 // TEMPORARY UI STATE only - neither is ever persisted.
 
-import { TARGETS, MESSAGE_TYPES, MIN_GAIN_PERCENT, MAX_GAIN_PERCENT, MAX_CUSTOM_NAME_LENGTH } from '../shared/constants.js';
+import {
+  TARGETS,
+  MESSAGE_TYPES,
+  MIN_GAIN_PERCENT,
+  MAX_GAIN_PERCENT,
+  MAX_CUSTOM_NAME_LENGTH,
+  MAX_BULK_PAGE_KEYS,
+} from '../shared/constants.js';
 import { registerMessageHandler, sendMessage, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
 import { createSavedPageSliderController } from '../shared/saved-page-slider.js';
 import { createClearConfirmController } from '../shared/clear-confirm.js';
 import { createNotificationController } from '../shared/notifications.js';
 import { getDisplayName } from '../shared/saved-page-metadata.js';
 import { filterSavedPageKeys } from '../shared/saved-pages-search.js';
+import { buildExportPayload, extractRawImportEntries, sanitizeImportEntries } from '../shared/saved-pages-import.js';
 import {
   selectAllVisible,
   deselectAllVisible,
@@ -53,6 +61,9 @@ const els = {
   clearConfirm: document.getElementById('clear-confirm'),
   clearConfirmYes: document.getElementById('clear-confirm-yes'),
   clearConfirmCancel: document.getElementById('clear-confirm-cancel'),
+  exportButton: document.getElementById('export-button'),
+  importButton: document.getElementById('import-button'),
+  importFileInput: document.getElementById('import-file-input'),
 };
 
 // --- View state (never persisted) ---
@@ -475,6 +486,80 @@ document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   clearConfirm.onEscape();
   if (!els.bulkDeleteConfirm.hidden) hideBulkDeleteConfirm();
+});
+
+// ---------------------------------------------------------------------------
+// Export / Import - entirely local, no network access of any kind. Export
+// serializes data already held in memory (from the last GET_SAVED_PAGES /
+// SAVED_PAGES_CHANGED) into a JSON file the browser saves; it never re-reads
+// or re-fetches anything. Import reads a local File the user picked through
+// the browser's own file picker - never uploaded or transmitted anywhere -
+// parses it locally, and sends the parsed entries to the service worker
+// exactly like every other saved-page mutation, which independently
+// validates and canonicalizes each one.
+// ---------------------------------------------------------------------------
+
+els.exportButton.addEventListener('click', () => {
+  const pageCount = Object.keys(savedPages).length;
+  if (pageCount === 0) {
+    setError('There are no saved pages to export.');
+    return;
+  }
+  const blob = new Blob([JSON.stringify(buildExportPayload(savedPages), null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `local-tab-audio-boost-saved-pages-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  setStatus(`Exported ${pageCount} saved ${pageCount === 1 ? 'page' : 'pages'}.`);
+});
+
+els.importButton.addEventListener('click', () => {
+  // Cleared first so picking the identical file twice in a row still fires
+  // a 'change' event the second time.
+  els.importFileInput.value = '';
+  els.importFileInput.click();
+});
+
+els.importFileInput.addEventListener('change', async () => {
+  const file = els.importFileInput.files?.[0];
+  if (!file) return;
+
+  let parsed;
+  try {
+    const text = await file.text();
+    parsed = JSON.parse(text);
+  } catch {
+    setError('Could not read this file - it is not valid JSON.');
+    return;
+  }
+
+  const rawEntries = extractRawImportEntries(parsed);
+  if (!rawEntries || rawEntries.length === 0) {
+    setError('This file has no saved pages to import.');
+    return;
+  }
+
+  const { entries, totalRawCount, droppedCount } = sanitizeImportEntries(rawEntries, MAX_BULK_PAGE_KEYS);
+  if (entries.length === 0) {
+    setError('This file has no valid saved pages to import.');
+    return;
+  }
+  if (droppedCount > 0) {
+    setStatus(`Importing ${entries.length} of ${totalRawCount} entries in this file.`);
+  }
+
+  const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.IMPORT_SAVED_PAGES, { entries });
+  if (!response.ok) {
+    setError(response.error?.message ?? 'Could not import this file.');
+    return;
+  }
+  const results = response.data?.results ?? [];
+  reportBulkOutcome(results, { verb: 'Imported' });
+  await refresh();
 });
 
 // ---------------------------------------------------------------------------

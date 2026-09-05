@@ -364,6 +364,32 @@ test('persistVolumesIfSaved: a batch matching nothing saved writes nothing', asy
   assert.equal(volumes['https://reset-untouched.example/'], 200, 'unrelated saved page is untouched');
 });
 
+test('importSavedPages: writes every given {pageKey, record} pair in one write, overwriting an existing record', async () => {
+  const stub = installSetPausableChromeStub();
+  await settings.addSavedPage('https://import-existing.example/', 150);
+
+  const setCallsBefore = stub.setCalls.length;
+  const { imported } = await settings.importSavedPages([
+    { pageKey: 'https://import-existing.example/', record: { volumePercent: 200, titleSnapshot: 'T', customName: 'N' } },
+    { pageKey: 'https://import-new.example/', record: { volumePercent: 250, titleSnapshot: '', customName: '' } },
+  ]);
+  assert.deepEqual([...imported].sort(), ['https://import-existing.example/', 'https://import-new.example/']);
+  assert.equal(stub.setCalls.length, setCallsBefore + 1, 'one write for the whole batch');
+
+  const pages = await settings.getSavedPages();
+  assert.deepEqual(pages['https://import-existing.example/'], { volumePercent: 200, titleSnapshot: 'T', customName: 'N' });
+  assert.deepEqual(pages['https://import-new.example/'], { volumePercent: 250, titleSnapshot: '', customName: '' });
+});
+
+test('importSavedPages: an empty batch writes nothing', async () => {
+  const stub = installSetPausableChromeStub();
+  await settings.getSavedPages(); // warm up schema init (a fresh install writes its own defaults once)
+  const setCallsBefore = stub.setCalls.length;
+  const { imported } = await settings.importSavedPages([]);
+  assert.equal(imported.size, 0);
+  assert.equal(stub.setCalls.length, setCallsBefore, 'no write for an empty batch');
+});
+
 test('duplicate persist is idempotent', async () => {
   installChromeStub();
   await settings.addSavedPage('https://w.example/', DEFAULT_VOLUME_PERCENT);

@@ -285,6 +285,35 @@ export function renameSavedPage(pageKey, customName) {
   });
 }
 
+/**
+ * Bulk-imports already-validated, already-canonicalized {pageKey, record}
+ * pairs (the service worker's IMPORT_SAVED_PAGES handler has already run
+ * each entry's pageKey through canonicalizePageKey and built its record via
+ * createSavedPageRecord - this function does no URL or shape validation of
+ * its own, exactly like every other function here). One read-modify-write
+ * for the WHOLE batch. Unlike addSavedPage, an entry whose exact pageKey is
+ * already saved OVERWRITES the existing record outright - import is an
+ * explicit, user-initiated restore, not a passive re-save, so it must be
+ * able to bring a page's volume/name back to a prior exported state. A
+ * duplicate pageKey within the same batch resolves to whichever entry
+ * appears LAST in `entries`, matching how a plain object literal would
+ * collapse duplicate keys.
+ */
+export function importSavedPages(entries) {
+  return enqueueMutation(async () => {
+    const pages = await readSavedPages();
+    const imported = new Set();
+    for (const { pageKey, record } of entries) {
+      pages[pageKey] = record;
+      imported.add(pageKey);
+    }
+    if (imported.size > 0) {
+      await writeSavedPages(pages);
+    }
+    return { imported };
+  });
+}
+
 /** Idempotent: removing an absent page is a successful no-op. */
 export function removeSavedPage(pageKey) {
   return enqueueMutation(async () => {

@@ -22,6 +22,13 @@
     <strong>Add this page</strong> or <strong>Add URL manually</strong>.
   </p>
 
+  <p class="options__note" role="note">
+    <strong>Export saved pages</strong> saves every saved page to a local JSON file.
+    <strong>Import saved pages</strong> reads a local JSON file (this extension's own export,
+    or a hand-edited list with the same shape) and adds its pages - an already-saved exact
+    URL is overwritten with the imported values. Neither ever touches the network.
+  </p>
+
   <!--
     One status line for both outcomes. Transient success/info messages clear
     themselves after a few seconds; errors stay until something replaces them.
@@ -64,6 +71,16 @@
       <span id="bulk-delete-confirm-text"></span>
       <button id="bulk-delete-confirm-yes" type="button" class="options__button options__button--danger">Yes, delete selected</button>
       <button id="bulk-delete-confirm-cancel" type="button" class="options__button options__button--secondary">Cancel</button>
+    </div>
+
+    <div class="options__bulk-row">
+      <button id="export-button" type="button" class="options__button options__button--secondary">
+        Export saved pages
+      </button>
+      <button id="import-button" type="button" class="options__button options__button--secondary">
+        Import saved pages
+      </button>
+      <input id="import-file-input" type="file" accept="application/json,.json" hidden />
     </div>
   </section>
 

@@ -45,6 +45,15 @@ export const MESSAGE_TYPES = Object.freeze({
   // unrelated page, and a failed page is never reported as succeeded.
   RESET_SELECTED_SAVED_PAGES_TO_100: 'RESET_SELECTED_SAVED_PAGES_TO_100',
   DELETE_SELECTED_SAVED_PAGES: 'DELETE_SELECTED_SAVED_PAGES',
+  // Options/saved-pages-view -> service worker: bulk-imports saved pages from
+  // a local JSON file the user picked (never fetched - a File the browser's
+  // own file picker already gave the page). Each entry is independently
+  // canonicalized and validated exactly like ADD_PAGE_MANUAL; a malformed or
+  // unsupported entry never blocks an unrelated one, and importing an already
+  // -saved exact pageKey OVERWRITES that page's stored record (an explicit,
+  // user-initiated restore - never merged/preserved like ADD_PAGE_MANUAL's
+  // idempotent-volume behavior).
+  IMPORT_SAVED_PAGES: 'IMPORT_SAVED_PAGES',
   // Popup -> service worker: starts the fullscreen-compatible page-audio
   // backend for the current tab. This is what an ordinary Enable click (or a
   // first slider move) requests; it never touches chrome.tabCapture, so the
