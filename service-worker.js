@@ -448,76 +448,90 @@ async function reconcileState() {
   }
   const capturedStatusByTabId = new Map(capturedTabs.map((info) => [info.tabId, info.status]));
 
-  const reconciled = new Map();
+  // Each candidate names a distinct tabId (the offscreen document's own
+  // session map cannot enumerate the same tabId twice), so validating and
+  // resolving them is embarrassingly parallel - a cold start with several
+  // simultaneously active tabs no longer pays for each candidate's
+  // verifyTabMatchesPageKey/confirmedStopCapture round trip one at a time.
+  // Every one of the throws below still aborts the ENTIRE reconciliation
+  // attempt exactly as before (Promise.all rejects on the first rejected
+  // task), so a partially-built cache is still never published; the only
+  // change is that independent candidates are now checked concurrently
+  // rather than in sequence.
+  const reconciledEntries = await Promise.all(
+    offscreenSessions.map(async (candidate) => {
+      const shapeOk =
+        Number.isInteger(candidate?.tabId) &&
+        typeof candidate?.operationId === 'string' &&
+        candidate.operationId.length > 0 &&
+        typeof candidate?.pageKey === 'string' &&
+        candidate.pageKey.length > 0 &&
+        Number.isInteger(candidate?.gainPercent) &&
+        candidate.gainPercent >= MIN_GAIN_PERCENT &&
+        candidate.gainPercent <= MAX_GAIN_PERCENT;
 
-  for (const candidate of offscreenSessions) {
-    const shapeOk =
-      Number.isInteger(candidate?.tabId) &&
-      typeof candidate?.operationId === 'string' &&
-      candidate.operationId.length > 0 &&
-      typeof candidate?.pageKey === 'string' &&
-      candidate.pageKey.length > 0 &&
-      Number.isInteger(candidate?.gainPercent) &&
-      candidate.gainPercent >= MIN_GAIN_PERCENT &&
-      candidate.gainPercent <= MAX_GAIN_PERCENT;
-
-    if (!shapeOk) {
-      // No trustworthy tabId/operationId to scope a stop by at all - never
-      // pretend a scoped stop was possible. Fail the whole reconciliation
-      // immediately; the emergency sweep's force:true path does not need a
-      // trustworthy operationId and will close the offscreen document if
-      // even that cannot be confirmed.
-      throw new Error('Malformed offscreen session candidate during reconciliation.');
-    }
-
-    // Re-validated through the same single canonicalization function every
-    // other exact-match decision in this codebase uses - never trust the
-    // offscreen document's own copy of pageKey without re-deriving it.
-    const canonical = canonicalizePageKey(candidate.pageKey);
-    const pageKeyValid = canonical.ok && canonical.pageKey === candidate.pageKey;
-
-    let needsTeardown = false;
-    const teardownReason = SESSION_STOP_REASONS.RECONCILIATION;
-
-    if (!pageKeyValid) {
-      needsTeardown = true;
-    } else {
-      const status = capturedStatusByTabId.get(candidate.tabId);
-      if (status !== 'active' && status !== 'pending') {
-        needsTeardown = true;
-      } else if (!(await verifyTabMatchesPageKey(candidate.tabId, candidate.pageKey))) {
-        needsTeardown = true;
+      if (!shapeOk) {
+        // No trustworthy tabId/operationId to scope a stop by at all - never
+        // pretend a scoped stop was possible. Fail the whole reconciliation
+        // immediately; the emergency sweep's force:true path does not need a
+        // trustworthy operationId and will close the offscreen document if
+        // even that cannot be confirmed.
+        throw new Error('Malformed offscreen session candidate during reconciliation.');
       }
-    }
 
-    if (needsTeardown) {
-      // These candidates come from the offscreen document's own
-      // enumeration, not from this service worker's (still-empty,
-      // being-rebuilt) local cache, so the cache-gated
-      // requestOffscreenTeardown does not apply here - confirmedStopCapture
-      // is called directly instead.
-      const { confirmed } = await confirmedStopCapture(candidate.tabId, {
-        operationId: candidate.operationId,
-        reason: teardownReason,
-      });
-      if (!confirmed) {
-        // Never publish a partially-built cache when a required teardown
-        // could not be positively confirmed - the offscreen graph may
-        // still be live. Abort the whole attempt so the emergency sweep
-        // runs instead of silently dropping this candidate while it might
-        // still be capturing.
-        throw new Error('Could not confirm teardown of a mismatched candidate during reconciliation.');
+      // Re-validated through the same single canonicalization function every
+      // other exact-match decision in this codebase uses - never trust the
+      // offscreen document's own copy of pageKey without re-deriving it.
+      const canonical = canonicalizePageKey(candidate.pageKey);
+      const pageKeyValid = canonical.ok && canonical.pageKey === candidate.pageKey;
+
+      let needsTeardown = false;
+
+      if (!pageKeyValid) {
+        needsTeardown = true;
+      } else {
+        const status = capturedStatusByTabId.get(candidate.tabId);
+        if (status !== 'active' && status !== 'pending') {
+          needsTeardown = true;
+        } else if (!(await verifyTabMatchesPageKey(candidate.tabId, candidate.pageKey))) {
+          needsTeardown = true;
+        }
       }
-      continue;
-    }
 
-    reconciled.set(candidate.tabId, {
-      operationId: candidate.operationId,
-      pageKey: candidate.pageKey,
-      state: 'active',
-      gainPercent: candidate.gainPercent,
-    });
-  }
+      if (needsTeardown) {
+        // These candidates come from the offscreen document's own
+        // enumeration, not from this service worker's (still-empty,
+        // being-rebuilt) local cache, so the cache-gated
+        // requestOffscreenTeardown does not apply here - confirmedStopCapture
+        // is called directly instead.
+        const { confirmed } = await confirmedStopCapture(candidate.tabId, {
+          operationId: candidate.operationId,
+          reason: SESSION_STOP_REASONS.RECONCILIATION,
+        });
+        if (!confirmed) {
+          // Never publish a partially-built cache when a required teardown
+          // could not be positively confirmed - the offscreen graph may
+          // still be live. Abort the whole attempt so the emergency sweep
+          // runs instead of silently dropping this candidate while it might
+          // still be capturing.
+          throw new Error('Could not confirm teardown of a mismatched candidate during reconciliation.');
+        }
+        return null;
+      }
+
+      return [
+        candidate.tabId,
+        {
+          operationId: candidate.operationId,
+          pageKey: candidate.pageKey,
+          state: 'active',
+          gainPercent: candidate.gainPercent,
+        },
+      ];
+    })
+  );
+
+  const reconciled = new Map(reconciledEntries.filter((entry) => entry !== null));
 
   // PendingStarts (getUserMedia()/graph construction still in flight at the
   // offscreen document, from a previous/unknown service-worker continuation)
@@ -532,6 +546,10 @@ async function reconcileState() {
   // attempt exactly like a mismatched Session candidate does, so
   // `reconciliationComplete` can never become true while a candidate might
   // still be live.
+  // Shape and cross-candidate conflict checks are synchronous and run over
+  // the whole batch FIRST, so a malformed or conflicting candidate is caught
+  // before any async cancellation is fired for this batch - identical
+  // ordering/outcome to the previous sequential loop.
   const claimedTabIds = new Set(reconciled.keys());
   for (const candidate of pendingCandidates) {
     const shapeOk =
@@ -549,18 +567,24 @@ async function reconcileState() {
       throw new Error('Conflicting pending-start candidate during reconciliation.');
     }
     claimedTabIds.add(candidate.tabId);
-
-    const { confirmed } = await confirmedStopCapture(candidate.tabId, {
-      operationId: candidate.operationId,
-      reason: SESSION_STOP_REASONS.RECONCILIATION,
-    });
-    if (!confirmed) {
-      throw new Error('Could not confirm cancellation of a pending-start candidate during reconciliation.');
-    }
-    // Never inserted into `reconciled` - a cancelled PendingStart is gone,
-    // not active, regardless of which of the three positive outcomes above
-    // actually applied.
   }
+
+  // Every candidate here is now known to name a distinct, unclaimed tabId,
+  // so their cancellations are independent and safe to run concurrently.
+  await Promise.all(
+    pendingCandidates.map(async (candidate) => {
+      const { confirmed } = await confirmedStopCapture(candidate.tabId, {
+        operationId: candidate.operationId,
+        reason: SESSION_STOP_REASONS.RECONCILIATION,
+      });
+      if (!confirmed) {
+        throw new Error('Could not confirm cancellation of a pending-start candidate during reconciliation.');
+      }
+      // Never inserted into `reconciled` - a cancelled PendingStart is gone,
+      // not active, regardless of which of the three positive outcomes above
+      // actually applied.
+    })
+  );
 
   // Only reached once every candidate has either passed every check or
   // been positively confirmed stopped/cancelled - never a partial/
