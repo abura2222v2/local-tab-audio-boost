@@ -1287,14 +1287,31 @@ async function handleDeleteSelectedSavedPages({ pageKeys }) {
   await ensureReconciled();
   // Each pageKey is an exact, distinct page - no two selected pageKeys can
   // ever share a live session's tabId (a session's pageKey is immutable and
-  // unique to its tab) - so deleting them is embarrassingly parallel. Storage
-  // writes still serialize correctly through settingsStore's own mutation
-  // queue regardless of the order these settle in.
-  const outcomes = await Promise.all(pageKeys.map((pageKey) => deleteOneSavedPage(pageKey)));
+  // unique to its tab) - so tearing them down is embarrassingly parallel.
+  const teardownOutcomes = await Promise.all(
+    pageKeys.map(async (pageKey) => {
+      const stopResult = await stopSnapshotSessions(
+        (entry) => entry.pageKey === pageKey,
+        SESSION_STOP_REASONS.REMOVED_FROM_SAVED_PAGES
+      );
+      return stopResult.ok ? { pageKey, ok: true } : { pageKey, ok: false, error: stopResult.error };
+    })
+  );
+
+  // Only pages whose teardown was positively confirmed are actually removed -
+  // exactly deleteOneSavedPage's contract, just applied to the whole
+  // selection in one storage round trip instead of one per page: N separate
+  // chrome.storage.local reads+writes collapse into a single
+  // read-modify-write inside one settingsStore mutation-queue turn.
+  const toRemove = teardownOutcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.pageKey);
+  if (toRemove.length > 0) {
+    await settingsStore.removeSavedPages(toRemove);
+  }
+
   let anyDeleted = false;
-  const results = outcomes.map((result) => {
-    if (result.ok) anyDeleted = true;
-    return result.ok ? { pageKey: result.pageKey, ok: true } : { pageKey: result.pageKey, ok: false, error: result.error };
+  const results = teardownOutcomes.map((outcome) => {
+    if (outcome.ok) anyDeleted = true;
+    return outcome.ok ? { pageKey: outcome.pageKey, ok: true } : { pageKey: outcome.pageKey, ok: false, error: outcome.error };
   });
   if (anyDeleted) {
     broadcastSavedPagesChanged();

@@ -269,6 +269,34 @@ export function removeSavedPage(pageKey) {
   });
 }
 
+/**
+ * Batch removal for bulk Delete selected: one read-modify-write for the
+ * WHOLE list, inside a single mutation-queue turn, instead of one
+ * chrome.storage.local round trip per pageKey. The caller has already
+ * decided (via confirmed session teardown, per pageKey) which of these are
+ * actually safe to remove - this never re-derives that decision, it only
+ * removes exactly the keys it is given. Idempotent per key, exactly like
+ * removeSavedPage: a key that is absent, or appears more than once, is a
+ * harmless no-op for that key. Writes storage at most once, and only if at
+ * least one given key actually existed.
+ */
+export function removeSavedPages(pageKeys) {
+  return enqueueMutation(async () => {
+    const pages = await readSavedPages();
+    const removed = new Set();
+    for (const pageKey of pageKeys) {
+      if (pageKey in pages) {
+        delete pages[pageKey];
+        removed.add(pageKey);
+      }
+    }
+    if (removed.size > 0) {
+      await writeSavedPages(pages);
+    }
+    return { removed };
+  });
+}
+
 /** Idempotent: clearing an already-empty list is a successful no-op. */
 export function clearSavedPages() {
   return enqueueMutation(async () => {

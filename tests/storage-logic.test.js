@@ -235,6 +235,40 @@ test('duplicate remove is idempotent', async () => {
   assert.equal(second.removed, false);
 });
 
+test('removeSavedPages: batch-removes exactly the given keys in one write, leaving others untouched', async () => {
+  const stub = installSetPausableChromeStub();
+  await settings.addSavedPage('https://batch-a.example/', DEFAULT_VOLUME_PERCENT);
+  await settings.addSavedPage('https://batch-b.example/', DEFAULT_VOLUME_PERCENT);
+  await settings.addSavedPage('https://batch-keep.example/', DEFAULT_VOLUME_PERCENT);
+
+  const setCallsBefore = stub.setCalls.length;
+  const { removed } = await settings.removeSavedPages(['https://batch-a.example/', 'https://batch-b.example/']);
+  assert.deepEqual([...removed].sort(), ['https://batch-a.example/', 'https://batch-b.example/']);
+  assert.equal(stub.setCalls.length, setCallsBefore + 1, 'one write for the whole batch, not one per key');
+
+  const pages = await savedVolumes();
+  assert.deepEqual(Object.keys(pages), ['https://batch-keep.example/']);
+});
+
+test('removeSavedPages: an absent or duplicated key is a harmless no-op for that key', async () => {
+  const stub = installSetPausableChromeStub();
+  await settings.addSavedPage('https://batch-only.example/', DEFAULT_VOLUME_PERCENT);
+
+  const setCallsBefore = stub.setCalls.length;
+  const { removed } = await settings.removeSavedPages([
+    'https://batch-only.example/',
+    'https://batch-missing.example/',
+    'https://batch-only.example/',
+  ]);
+  assert.deepEqual([...removed], ['https://batch-only.example/']);
+  assert.equal(stub.setCalls.length, setCallsBefore + 1);
+
+  // Removing a batch that matches nothing at all writes nothing.
+  const result = await settings.removeSavedPages(['https://nothing-here.example/']);
+  assert.deepEqual([...result.removed], []);
+  assert.equal(stub.setCalls.length, setCallsBefore + 1, 'no write when nothing in the batch existed');
+});
+
 test('duplicate persist is idempotent', async () => {
   installChromeStub();
   await settings.addSavedPage('https://w.example/', DEFAULT_VOLUME_PERCENT);
