@@ -151,13 +151,42 @@ function ensureSchemaInitialized() {
   return schemaInitPromise;
 }
 
+/**
+ * In-process cache of the last known-good normalized savedPages map, valid
+ * for the lifetime of this module instance (cleared implicitly by a service-
+ * worker restart, which gets a fresh module realm). This module is the ONLY
+ * writer of chrome.storage.local's savedPages key in the whole extension
+ * (see the file-level comment), so nothing outside writeSavedPages below can
+ * ever invalidate it - caching is safe precisely because that invariant
+ * holds. Without this, every single read (GET_TAB_STATE on every popup open,
+ * GET_SAVED_PAGES, the auto-resume check on every navigation, every bulk
+ * per-page operation) re-ran normalizeSavedPages - a URL parse plus record
+ * validation for EVERY saved page - even when nothing had changed since the
+ * last read.
+ */
+let cachedSavedPages = null;
+
 async function readSavedPages() {
   await ensureSchemaInitialized();
-  return normalizeSavedPages(await readRaw(STORAGE_KEYS.SAVED_PAGES, {}));
+  if (cachedSavedPages === null) {
+    cachedSavedPages = normalizeSavedPages(await readRaw(STORAGE_KEYS.SAVED_PAGES, {}));
+  }
+  // A fresh shallow copy on every call: every mutation function in this
+  // module treats the map it gets back as its own private read-modify-write
+  // surface (it may delete a key from it, or reassign a key to a brand-new
+  // record, before writing the result back) - handing out the literal cached
+  // object to more than one caller would let one caller's in-progress edit
+  // leak into another's view before either actually commits. Individual
+  // record objects are never mutated in place anywhere in this module (a
+  // change always replaces a key with a brand-new record via `pages[key] =
+  // {...}`), so sharing THOSE by reference between the cache and every copy
+  // is safe, and this copy is a cheap O(n) key copy - not a re-normalization.
+  return { ...cachedSavedPages };
 }
 
 async function writeSavedPages(pages) {
   await chrome.storage.local.set({ [STORAGE_KEYS.SAVED_PAGES]: pages });
+  cachedSavedPages = pages;
 }
 
 export async function getSettings() {
@@ -416,12 +445,14 @@ export function persistExistingVolumeIfPreconditionHolds(pageKey, volumePercent,
 
 /**
  * Test-only: resets internal singleton state (the schema-initialization
- * gate and the mutation queue) between test runs. Not called by any
- * extension context - only by tests/storage-logic.test.js and
- * tests/service-worker-logic.test.js, so each test can rely on a fresh
- * "first service-worker instance" view of storage.
+ * gate, the mutation queue, and the normalized-savedPages cache) between
+ * test runs. Not called by any extension context - only by
+ * tests/storage-logic.test.js and tests/service-worker-logic.test.js, so
+ * each test can rely on a fresh "first service-worker instance" view of
+ * storage rather than seeing another test's cached savedPages.
  */
 export function __resetForTests() {
   schemaInitPromise = null;
   mutationQueue = Promise.resolve();
+  cachedSavedPages = null;
 }

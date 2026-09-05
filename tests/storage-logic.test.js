@@ -226,6 +226,68 @@ test('duplicate save is idempotent and preserves the already-saved volume', asyn
   assert.equal(pages['https://y.example/'], 175);
 });
 
+test('getSavedPages: a second read is served from the in-process cache, never touching storage again', async () => {
+  let getCalls = 0;
+  let store = {
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://cache-hit.example/': { volumePercent: 150, titleSnapshot: '', customName: '' },
+    },
+  };
+  globalThis.chrome = {
+    storage: {
+      local: {
+        async get(key) {
+          getCalls += 1;
+          if (typeof key === 'string') {
+            return Object.prototype.hasOwnProperty.call(store, key) ? { [key]: store[key] } : {};
+          }
+          return { ...store };
+        },
+        async set(obj) {
+          store = { ...store, ...obj };
+        },
+        async setAccessLevel() {
+          return undefined;
+        },
+      },
+    },
+  };
+  settings.__resetForTests();
+
+  await settings.getSavedPages();
+  const callsAfterFirstRead = getCalls;
+  assert.ok(callsAfterFirstRead > 0, 'the first read genuinely touches storage');
+
+  await settings.getSavedPages();
+  await settings.getSavedPages();
+  assert.equal(getCalls, callsAfterFirstRead, 'subsequent reads are served from the cache, not from storage');
+
+  // A write still invalidates/refreshes the cache with the new value - the
+  // very next read reflects it without needing another storage.get at all.
+  await settings.addSavedPage('https://cache-hit-2.example/', DEFAULT_VOLUME_PERCENT);
+  const pages = await settings.getSavedPages();
+  assert.equal(getCalls, callsAfterFirstRead, 'the write path never calls storage.get either');
+  assert.ok('https://cache-hit-2.example/' in pages, 'the cache reflects the write immediately');
+});
+
+test('getSavedPages: the returned map is a private copy - mutating it never corrupts the cache for the next caller', async () => {
+  installChromeStub({
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://isolated.example/': { volumePercent: 150, titleSnapshot: '', customName: '' },
+    },
+  });
+
+  const first = await settings.getSavedPages();
+  delete first['https://isolated.example/'];
+  first['https://injected.example/'] = { volumePercent: 999, titleSnapshot: '', customName: '' };
+
+  const second = await settings.getSavedPages();
+  assert.ok('https://isolated.example/' in second, 'a deletion on one caller\'s copy never affects another read');
+  assert.equal('https://injected.example/' in second, false, 'an addition on one caller\'s copy never leaks into another read');
+});
+
 test('duplicate remove is idempotent', async () => {
   installChromeStub();
   await settings.addSavedPage('https://z.example/', DEFAULT_VOLUME_PERCENT);
@@ -728,8 +790,20 @@ test('a failed schema initialization can be retried by a later caller', async ()
 // readSavedPages()'s chrome.storage.local.get call is in flight. ---
 
 test('persistExistingVolumeIfPreconditionHolds: a precondition that becomes false while storage.get is in flight writes nothing', async () => {
-  const stub = installPausableChromeStub();
-  await settings.addSavedPage('https://race-persist.example/', DEFAULT_VOLUME_PERCENT); // warm up schema init unpaused
+  // Storage is seeded directly (schema already current) rather than via a
+  // warm-up addSavedPage() call: readSavedPages() caches its normalized
+  // result for the life of the module instance (see shared/settings.js), so
+  // a prior successful read/write would make the read below a cache hit -
+  // never actually reaching chrome.storage.local.get at all, defeating the
+  // whole point of this test. Seeding storage directly, with the cache still
+  // cold from __resetForTests(), guarantees the paused get() below is the
+  // real, first, in-flight read this test depends on.
+  const stub = installPausableChromeStub({
+    [STORAGE_KEYS.SETTINGS]: { schemaVersion: SCHEMA_VERSION },
+    [STORAGE_KEYS.SAVED_PAGES]: {
+      'https://race-persist.example/': { volumePercent: DEFAULT_VOLUME_PERCENT, titleSnapshot: '', customName: '' },
+    },
+  });
   const releaseGet = stub.pauseGet();
 
   let stillValid = true;
