@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Local Tab Audio Boost",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Boost tab audio up to 300%. Save local volume rules for one address, a page, a section, or an entire website.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "tabCapture", "offscreen", "storage", "webNavigation", "scripting"],

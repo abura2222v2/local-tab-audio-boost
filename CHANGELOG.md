@@ -4,9 +4,14 @@ User-visible changes only.
 
 ## Unreleased
 
+## 0.6.0 - 2026-09-11
+
 - Added direct URL entry to the Saved pages view, with exact-address, page,
   path-section, and whole-site matching scopes. More specific rules override
   broader rules, and matching remains entirely local.
+- Saved-rule sliders now update every active tab governed by that rule, while
+  an exact-page rule can keep its own independent volume.
+- Export and import now preserve each saved rule's matching scope.
 
 - Saved volume now resumes after History API and fragment navigation on
   single-page applications, including when moving between two saved routes.
