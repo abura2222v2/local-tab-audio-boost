@@ -4,6 +4,7 @@ import { createPopupController } from '../shared/popup-controller.js';
 import { createManualAddModalController } from '../shared/manual-add-modal.js';
 
 const els = {
+  popupMain: document.getElementById('popup-main'),
   pageUrl: document.getElementById('page-url'),
   statusLine: document.getElementById('status-line'),
   sliderArea: document.getElementById('slider-area'),
@@ -284,9 +285,17 @@ const manualModal = createManualAddModalController({
     await refresh();
     return { ok: true };
   },
+  onClosed: () => {
+    els.popupMain.inert = false;
+    els.manualAddButton.focus();
+  },
 });
 
 els.manualAddButton.addEventListener('click', () => {
+  // Keep keyboard focus inside the modal while it is open. The overlay is a
+  // sibling of <main>, so making the background inert does not affect the
+  // modal's own controls.
+  els.popupMain.inert = true;
   manualModal.open();
   els.manualUrlInput.focus();
 });
@@ -316,11 +325,10 @@ document.addEventListener('visibilitychange', () => {
 async function handlePopupMessage(message) {
   if (message.type === MESSAGE_TYPES.TAB_STATE_CHANGED && message.payload?.tabId === currentTabId) {
     applyState(message.payload);
-  } else if (message.type === MESSAGE_TYPES.SAVED_PAGE_CHANGED && message.payload?.pageKey === currentPageKey) {
-    // A Saved-pages row for THIS exact page changed its stored value. Refresh
-    // so an inactive popup shows the new saved default (an active tab already
-    // got its live TAB_STATE_CHANGED above). Exact-page-scoped by the pageKey
-    // equality check; never starts capture.
+  } else if (message.type === MESSAGE_TYPES.SAVED_PAGE_CHANGED) {
+    // A changed broad rule may match this tab even when its stored key differs
+    // from the tab's exact URL, so refresh from the authoritative worker state.
+    // Refreshing never starts capture.
     refresh();
   }
   return { ok: true, data: {} };

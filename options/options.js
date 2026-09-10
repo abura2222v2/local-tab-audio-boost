@@ -1,8 +1,7 @@
 // Saved-pages management: view, search, select, per-row volume, rename,
-// delete, bulk actions, and clear all. Adding a new saved page happens
-// exclusively from the popup ("Add this page" / "Add URL manually"); this view
-// never opens the page it lists, never captures a tab, and never grants a
-// domain-wide permission.
+// delete, bulk actions, clear all, and direct URL-rule creation. This view
+// never opens a URL it saves and never captures a tab. A site-wide rule is a
+// local matching preference, not a network or browser permission grant.
 //
 // Every read and write goes through the service worker; this file never calls
 // chrome.storage.local directly. It also performs NO network access of any
@@ -18,6 +17,8 @@ import {
   MAX_GAIN_PERCENT,
   MAX_CUSTOM_NAME_LENGTH,
   MAX_BULK_PAGE_KEYS,
+  MAX_IMPORT_FILE_BYTES,
+  SAVED_PAGE_MATCH_MODES,
 } from '../shared/constants.js';
 import { registerMessageHandler, sendMessage, validateServiceWorkerOriginatedSender } from '../shared/messages.js';
 import { createSavedPageSliderController } from '../shared/saved-page-slider.js';
@@ -64,11 +65,17 @@ const els = {
   exportButton: document.getElementById('export-button'),
   importButton: document.getElementById('import-button'),
   importFileInput: document.getElementById('import-file-input'),
+  addRuleForm: document.getElementById('add-rule-form'),
+  addUrlInput: document.getElementById('add-url-input'),
+  addScopeSelect: document.getElementById('add-scope-select'),
+  addNameInput: document.getElementById('add-name-input'),
+  addVolumeInput: document.getElementById('add-volume-input'),
+  addVolumeOutput: document.getElementById('add-volume-output'),
 };
 
 // --- View state (never persisted) ---
 let savedPages = {}; // authoritative schema-6 map, as last read from the SW
-let activePageKeys = new Set(); // exact pageKeys currently boosting, when known
+let activePageKeys = new Set(); // saved rule keys currently governing an active tab
 let selected = new Set(); // temporary selection
 let searchQuery = '';
 let visibleKeys = [];
@@ -77,6 +84,13 @@ let renamingPageKey = null; // the row currently showing its inline rename edito
 // One entry per rendered row, so a live-gain broadcast can move exactly one
 // row without a full re-render, and so throttle timers can be disposed.
 const rows = new Map(); // pageKey -> { slider, volumeSpan, controller }
+
+const MATCH_MODE_LABELS = Object.freeze({
+  [SAVED_PAGE_MATCH_MODES.EXACT]: 'Exact address',
+  [SAVED_PAGE_MATCH_MODES.PAGE]: 'Page and episodes',
+  [SAVED_PAGE_MATCH_MODES.PATH]: 'Section and subpages',
+  [SAVED_PAGE_MATCH_MODES.SITE]: 'Entire website',
+});
 
 function disposeRows() {
   for (const row of rows.values()) row.controller.dispose();
@@ -111,8 +125,9 @@ function clearStatus() {
  * failed, the summary names a real failure and must stay on screen until the
  * user acts again.
  */
-function reportBulkOutcome(results, options) {
-  const summary = summarizeBulkResults(results, options);
+function reportBulkOutcome(results, options, extraMessage = '') {
+  const baseSummary = summarizeBulkResults(results, options);
+  const summary = extraMessage ? `${baseSummary} ${extraMessage}` : baseSummary;
   const anyFailed = results.some((result) => !result.ok);
   if (anyFailed) setError(summary);
   else setStatus(summary);
@@ -221,17 +236,21 @@ function buildRow(pageKey, record) {
   nameSpan.textContent = displayName;
   nameSpan.title = displayName;
 
-  // The exact URL is shown in full via title text and only visually truncated.
+  // The canonical saved-rule URL is available in full via title text.
   const keySpan = document.createElement('span');
   keySpan.className = 'options__page-key';
   keySpan.textContent = pageKey;
   keySpan.title = pageKey;
 
+  const scopeSpan = document.createElement('span');
+  scopeSpan.className = 'options__scope';
+  scopeSpan.textContent = MATCH_MODE_LABELS[record.matchMode ?? SAVED_PAGE_MATCH_MODES.EXACT];
+
   const status = document.createElement('span');
   status.className = isActive ? 'options__status options__status--active' : 'options__status';
   status.textContent = isActive ? 'Boosting now' : 'Not boosting';
 
-  main.append(nameSpan, keySpan, status);
+  main.append(nameSpan, keySpan, scopeSpan, status);
 
   const slider = document.createElement('input');
   slider.type = 'range';
@@ -250,7 +269,7 @@ function buildRow(pageKey, record) {
   volumeSpan.textContent = `${record.volumePercent}%`;
 
   // `input` (while dragging) drives a THROTTLED, LIVE-ONLY gain - it changes
-  // the audio of any tab currently boosting this identical exact URL but
+  // the audio of any tab currently governed by this saved rule but
   // writes nothing. `change` (on release) flushes the final live value, then
   // persists it exactly once.
   const controller = createSavedPageSliderController({
@@ -327,7 +346,7 @@ function render() {
 }
 
 /**
- * Moves ONLY the matching exact row's slider + percentage to a live gain
+ * Moves only the matching saved-rule row's slider + percentage to a live gain
  * driven by the popup slider (a SAVED_PAGE_LIVE_GAIN_CHANGED broadcast). Never
  * persists and never re-renders the whole list; a pageKey with no
  * currently-rendered row is a harmless no-op.
@@ -372,6 +391,29 @@ async function removePage(pageKey) {
 // ---------------------------------------------------------------------------
 // Toolbar wiring
 // ---------------------------------------------------------------------------
+
+els.addVolumeInput.addEventListener('input', () => {
+  els.addVolumeOutput.textContent = `${els.addVolumeInput.value}%`;
+});
+
+els.addRuleForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  clearStatus();
+  const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.ADD_PAGE_MANUAL, {
+    rawUrl: els.addUrlInput.value.trim(),
+    matchMode: els.addScopeSelect.value,
+    gainPercent: Number(els.addVolumeInput.value),
+    customName: els.addNameInput.value,
+  });
+  if (!response.ok) {
+    setError(response.error?.message ?? 'Could not add this address.');
+    return;
+  }
+  els.addUrlInput.value = '';
+  els.addNameInput.value = '';
+  setStatus('Saved rule added.');
+  await refresh();
+});
 
 // Debounced: filtering + a full list rebuild on every single keystroke is
 // wasted work while the user is still typing a multi-character query. The
@@ -527,6 +569,10 @@ els.importButton.addEventListener('click', () => {
 els.importFileInput.addEventListener('change', async () => {
   const file = els.importFileInput.files?.[0];
   if (!file) return;
+  if (file.size > MAX_IMPORT_FILE_BYTES) {
+    setError('This file is too large to import. Choose a JSON file smaller than 5 MB.');
+    return;
+  }
 
   let parsed;
   try {
@@ -543,22 +589,29 @@ els.importFileInput.addEventListener('change', async () => {
     return;
   }
 
-  const { entries, totalRawCount, droppedCount } = sanitizeImportEntries(rawEntries, MAX_BULK_PAGE_KEYS);
+  const { entries, droppedCount } = sanitizeImportEntries(rawEntries);
   if (entries.length === 0) {
     setError('This file has no valid saved pages to import.');
     return;
   }
-  if (droppedCount > 0) {
-    setStatus(`Importing ${entries.length} of ${totalRawCount} entries in this file.`);
+  const results = [];
+  for (let offset = 0; offset < entries.length; offset += MAX_BULK_PAGE_KEYS) {
+    const batch = entries.slice(offset, offset + MAX_BULK_PAGE_KEYS);
+    const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.IMPORT_SAVED_PAGES, { entries: batch });
+    if (!response.ok) {
+      const imported = results.filter((result) => result?.ok).length;
+      const prefix = imported > 0 ? `Imported ${imported} ${imported === 1 ? 'page' : 'pages'} before import stopped. ` : '';
+      setError(`${prefix}${response.error?.message ?? 'Could not import this file.'}`);
+      await refresh();
+      return;
+    }
+    results.push(...(response.data?.results ?? []));
   }
-
-  const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.IMPORT_SAVED_PAGES, { entries });
-  if (!response.ok) {
-    setError(response.error?.message ?? 'Could not import this file.');
-    return;
-  }
-  const results = response.data?.results ?? [];
-  reportBulkOutcome(results, { verb: 'Imported' });
+  const skippedMessage =
+    droppedCount > 0
+      ? `${droppedCount} ${droppedCount === 1 ? 'malformed entry was' : 'malformed entries were'} skipped.`
+      : '';
+  reportBulkOutcome(results, { verb: 'Imported' }, skippedMessage);
   await refresh();
 });
 

@@ -9,10 +9,11 @@ reporting, no advertising, and no user identifier of any kind.
 
 ## Network activity
 
-The extension makes no network requests. It contains no code that could make
-one: no `fetch`, no `XMLHttpRequest`, no `WebSocket`, no `EventSource`, no
-remote scripts, no remote fonts, and no remote images. Nothing you do in the
-extension leaves your device.
+The extension makes no network requests of its own. It contains no code that
+could initiate one: no `fetch`, no `XMLHttpRequest`, no `WebSocket`, no
+`EventSource`, no remote scripts, no remote fonts, and no remote images.
+Nothing you do in the extension is transmitted by the extension. Web pages
+and media players continue making their own normal requests independently.
 
 In particular:
 
@@ -43,7 +44,8 @@ trusted extension contexts. For each page you choose to save:
 
 | Field | Contents |
 |---|---|
-| exact page URL | the address you saved, used as the key |
+| saved URL rule | the address you saved, used as the key |
+| matching scope | exact address, page fragments, path section, or whole website |
 | volume percentage | an integer from 0 to 300 |
 | title snapshot | the tab's title, read locally only when you press **Add this page**; empty for manually added URLs |
 | custom name | an optional label you type yourself; empty unless you set one |
@@ -69,6 +71,9 @@ They are never transmitted, but they are stored in plain text locally — see
 
 ## Audio
 
-Tab audio is processed locally by an offscreen document using the Web Audio
-API, and only while you have explicitly started boosting. Audio is never
-recorded, stored, or transmitted.
+Audio is processed locally with the Web Audio API. Fullscreen-compatible mode
+runs a small packaged engine in the page; compatibility mode uses an extension
+offscreen document. Processing starts when you enable boosting, move the
+  popup slider, choose compatibility mode, or reopen a URL matched by a saved rule whose
+volume can resume automatically. Audio is never recorded, stored, or
+transmitted by the extension.

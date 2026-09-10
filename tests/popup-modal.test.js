@@ -207,6 +207,20 @@ test('source: popup.js resetFields clears the stale error text on open', () => {
   assert.match(js, /resetFields:\s*\(\)\s*=>\s*\{[\s\S]*manualAddError\.textContent\s*=\s*''/, 'resetFields clears the error text');
 });
 
+test('accessibility: opening makes the background inert and closing restores focus to the trigger', () => {
+  const html = read('popup/popup.html');
+  const js = read('popup/popup.js');
+  assert.match(html, /<main[^>]*id="popup-main"/);
+  assert.match(js, /popupMain\.inert\s*=\s*true[\s\S]*manualModal\.open\(\)/);
+  assert.match(js, /onClosed:\s*\(\)\s*=>\s*\{[\s\S]*popupMain\.inert\s*=\s*false[\s\S]*manualAddButton\.focus\(\)/);
+});
+
+test('accessibility: the optional name field has the same styling and visible focus as the URL field', () => {
+  const css = stripCssComments(read('popup/popup.css'));
+  assert.match(css, /#manual-url-input\s*,\s*#manual-name-input\s*\{/);
+  assert.match(css, /#manual-url-input:focus-visible\s*,\s*#manual-name-input:focus-visible\s*\{/);
+});
+
 test('source: the submit path returns {ok:false} on validation/save failure (so the controller keeps the modal open)', () => {
   const js = read('popup/popup.js');
   const submitBlock = (js.match(/submit:\s*async\s*\(\)\s*=>\s*\{[\s\S]*?\n  \},/) || [''])[0];

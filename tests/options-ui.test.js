@@ -139,3 +139,41 @@ test('ui: bulk buttons are disabled while nothing is selected', () => {
   }
   assert.match(js(), /els\.clearSelection\.disabled = nothingSelected/, 'and is re-enabled only when something is selected');
 });
+
+test('import: oversized files are rejected before their contents are read or parsed', () => {
+  const js = read('options/options.js');
+  const sizeCheck = js.indexOf('file.size > MAX_IMPORT_FILE_BYTES');
+  const fileRead = js.indexOf('await file.text()');
+  assert.ok(sizeCheck >= 0, 'the import path has an explicit file-size bound');
+  assert.ok(fileRead > sizeCheck, 'the bound is enforced before File.text() allocates the contents');
+});
+
+test('import: the final outcome keeps the skipped-entry count visible', () => {
+  const js = read('options/options.js');
+  assert.match(js, /const skippedMessage\s*=/);
+  assert.match(js, /reportBulkOutcome\(results,\s*\{\s*verb:\s*'Imported'\s*\},\s*skippedMessage\)/);
+});
+
+test('import: lists larger than one message are sent in bounded batches instead of truncated', () => {
+  const js = read('options/options.js');
+  assert.match(js, /offset\s*\+=\s*MAX_BULK_PAGE_KEYS/);
+  assert.match(js, /entries\.slice\(offset,\s*offset\s*\+\s*MAX_BULK_PAGE_KEYS\)/);
+  assert.doesNotMatch(js, /sanitizeImportEntries\(rawEntries,\s*MAX_BULK_PAGE_KEYS\)/);
+});
+
+test('saved rules: the options page has a direct URL form with all four matching scopes', () => {
+  const markup = html();
+  assert.match(markup, /id="add-rule-form"/);
+  assert.match(markup, /id="add-url-input"[^>]*type="url"/);
+  for (const mode of ['exact', 'page', 'path', 'site']) {
+    assert.match(markup, new RegExp(`<option value="${mode}">`));
+  }
+});
+
+test('saved rules: submitting the options form sends its selected match mode without opening the URL', () => {
+  const source = js();
+  assert.match(source, /els\.addRuleForm\.addEventListener\('submit'/);
+  assert.match(source, /matchMode:\s*els\.addScopeSelect\.value/);
+  assert.match(source, /MESSAGE_TYPES\.ADD_PAGE_MANUAL/);
+  assert.doesNotMatch(source, /window\.open|chrome\.tabs\.create/);
+});

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local Tab Audio Boost manual test</title>
+  <link rel="stylesheet" href="/manual-audio.css" />
+</head>
+<body>
+  <main id="test-panel">
+    <h1>Local Tab Audio Boost manual test</h1>
+    <p>
+      This page creates a short 440 Hz WAV entirely in your browser. It makes
+      no network requests after the page itself is loaded from localhost.
+    </p>
+
+    <section aria-labelledby="audio-heading">
+      <h2 id="audio-heading">Audio source</h2>
+      <audio id="player" controls loop></audio>
+      <div class="actions">
+        <button id="source-now" type="button">Create source now</button>
+        <button id="source-later" type="button">Create source after 2 seconds</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="route-heading">
+      <h2 id="route-heading">Same-document routes</h2>
+      <div class="actions">
+        <button type="button" data-route="/route-a#player">Route A</button>
+        <button type="button" data-route="/route-b?episode=2#player">Route B</button>
+        <button type="button" data-route="/unsaved">Unsaved route</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="fullscreen-heading">
+      <h2 id="fullscreen-heading">Fullscreen</h2>
+      <button id="fullscreen" type="button">Toggle page fullscreen</button>
+    </section>
+
+    <p id="status" role="status" aria-live="polite"></p>
+    <p>Current exact address: <code id="current-address"></code></p>
+  </main>
+  <script src="/manual-audio.js"></script>
+</body>
+</html>

@@ -2,8 +2,9 @@
 // tabCapture / offscreen-document lifecycle, cold-start reconciliation, and
 // the only module that mutates persistent storage (via shared/settings.js).
 //
-// IMPORTANT product-model note: a saved page is a stored PREFERENCE (its
-// exact URL plus a preferred gain percentage), never a capture permission.
+// IMPORTANT product-model note: a saved page is a stored PREFERENCE (a
+// canonical URL rule plus a preferred gain percentage), never a capture
+// permission.
 // START_CAPTURE never checks savedPages membership - any supported current
 // http/https page can be temporarily boosted after an explicit user action,
 // saved or not. See README.md/SECURITY.md for the full product model.
@@ -35,11 +36,13 @@ import {
   BRIDGE_COMMANDS,
   PAGE_AUDIO_STATES,
   isRunningState,
+  isValidPageAudioSnapshot,
   describeRefusal,
 } from './shared/page-audio-policy.js';
 import { createPageAudioRegistry } from './shared/page-audio-session.js';
 import { createOffscreenIdleCloser } from './shared/offscreen-idle.js';
 import { canonicalizePageKey } from './shared/urls.js';
+import { canonicalizeSavedPageRule, findSavedPageMatch } from './shared/saved-page-rules.js';
 import * as settingsStore from './shared/settings.js';
 
 // ---------------------------------------------------------------------------
@@ -757,7 +760,7 @@ async function resolvePageKeyForTab(tabId) {
 }
 
 /**
- * `saved` reports whether the tab's exact current pageKey has a stored
+ * `saved` reports whether the tab's exact current pageKey matches a stored
  * preference - independent of `state`. A page needs no saved preference to
  * be temporarily boosted; `saved` only ever affects whether
  * PERSIST_PAGE_VOLUME is allowed to write anything.
@@ -799,7 +802,8 @@ async function computeTabStateData(tabId) {
     };
   }
   const savedPages = await settingsStore.getSavedPages();
-  const savedRecord = savedPages[resolved.pageKey];
+  const savedMatch = findSavedPageMatch(savedPages, resolved.pageKey);
+  const savedRecord = savedMatch?.record;
   const saved = Boolean(savedRecord);
   const matchesEntry = Boolean(entry) && entry.pageKey === resolved.pageKey;
   const state = matchesEntry ? entry.state : 'inactive';
@@ -811,6 +815,7 @@ async function computeTabStateData(tabId) {
     tabId,
     pageKey: resolved.pageKey,
     displayUrl: resolved.pageKey,
+    savedPageKey: savedMatch?.pageKey ?? null,
     saved,
     state,
     gainPercent,
@@ -839,7 +844,7 @@ async function broadcastSavedPagesChanged() {
     const savedPages = await settingsStore.getSavedPages();
     await sendMessage(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED, {
       savedPages,
-      activePageKeys: listActivePageKeys(),
+      activePageKeys: listActivePageKeys(savedPages),
     });
   } catch {
     // Best-effort only - the saved-pages view may not be open.
@@ -847,11 +852,9 @@ async function broadcastSavedPagesChanged() {
 }
 
 /**
- * Narrowly-scoped notice to any open popup that ONE exact saved pageKey's
- * stored value changed. The popup refreshes only if that pageKey matches the
- * tab it is open on, and never starts capture - see handlePopupMessage in
- * popup.js. Carries just the pageKey (never the whole map), so the popup is
- * not subscribed to a broad map broadcast.
+ * Notice to any open popup that one saved rule changed. The popup refreshes
+ * its own tab state because a broad rule key need not equal the tab's exact
+ * pageKey. Refreshing never starts capture.
  */
 async function broadcastSavedPageChangedToPopup(pageKey) {
   try {
@@ -1103,15 +1106,16 @@ async function applyConfirmedGainToSession(tabId, operationId, clamped) {
   return true;
 }
 
-async function propagateGainToSessionsSharingPageKey(pageKey, clamped) {
+async function propagateGainToSessionsUsingSavedRule(pageKey, clamped, savedPages) {
   // Snapshotted first (mirroring stopSnapshotSessions below) so concurrent
   // application never iterates `sessions` while it is being mutated, then
   // applied to every matching tabId in parallel: each target is a distinct
   // tabId, so their offscreen/page-audio round trips and cache updates never
   // touch one another's state.
-  const snapshot = [...sessions.entries()].filter(
-    ([, entry]) => entry.pageKey === pageKey && entry.state === 'active'
-  );
+  const snapshot = [...sessions.entries()].filter(([, entry]) => {
+    if (entry.state !== 'active' || !entry.pageKey) return false;
+    return findSavedPageMatch(savedPages, entry.pageKey)?.pageKey === pageKey;
+  });
   await Promise.all(
     snapshot.map(([otherTabId, otherEntry]) => applyConfirmedGainToSession(otherTabId, otherEntry.operationId, clamped))
   );
@@ -1128,15 +1132,17 @@ async function handleGetTabState({ tabId }) {
 }
 
 /**
- * The exact pageKeys that currently have an ACTIVE session, so the saved-pages
- * view can show a per-row boosting status. Derived purely from the live
+ * The saved rule keys that currently govern an ACTIVE session, so the
+ * saved-pages view can show a per-row boosting status. Derived from the live
  * in-memory session cache - session state is never persisted, and this list is
  * never stored.
  */
-function listActivePageKeys() {
+function listActivePageKeys(savedPages) {
   const keys = new Set();
   for (const entry of sessions.values()) {
-    if (entry.state === 'active' && entry.pageKey) keys.add(entry.pageKey);
+    if (entry.state !== 'active' || !entry.pageKey) continue;
+    const savedMatch = findSavedPageMatch(savedPages, entry.pageKey);
+    if (savedMatch) keys.add(savedMatch.pageKey);
   }
   return [...keys];
 }
@@ -1144,7 +1150,7 @@ function listActivePageKeys() {
 async function handleGetSavedPages() {
   await ensureReconciled();
   const savedPages = await settingsStore.getSavedPages();
-  return { ok: true, data: { savedPages, activePageKeys: listActivePageKeys() } };
+  return { ok: true, data: { savedPages, activePageKeys: listActivePageKeys(savedPages) } };
 }
 
 /**
@@ -1185,20 +1191,21 @@ async function handleAddCurrentPage({ tabId, expectedPageKey, gainPercent }) {
 }
 
 /**
- * A manually entered URL is NEVER visited, fetched, or captured, so it can
+ * A manually entered URL rule is NEVER visited, fetched, or captured, so it can
  * have no titleSnapshot - only the optional local name the user typed. An
  * empty name leaves the display falling back to a locally derived URL label.
  * Re-adding an already-saved URL never duplicates it: the existing record's
  * titleSnapshot is preserved, and an existing customName is only replaced when
  * the user actually supplied a new one.
  */
-async function handleAddPageManual({ rawUrl, gainPercent, customName }) {
+async function handleAddPageManual({ rawUrl, gainPercent, customName, matchMode }) {
   await ensureReconciled();
-  const result = canonicalizePageKey(rawUrl);
+  const result = canonicalizeSavedPageRule(rawUrl, matchMode);
   if (!result.ok) return { ok: false, error: { code: result.code, message: describeUrlErrorCode(result.code) } };
   const clamped = gainPercent === undefined ? DEFAULT_VOLUME_PERCENT : (clampGainPercent(gainPercent) ?? DEFAULT_VOLUME_PERCENT);
   const added = await settingsStore.addSavedPage(result.pageKey, clamped, {
     customName: sanitizeCustomName(customName),
+    matchMode: result.matchMode,
   });
   broadcastSavedPagesChanged();
   broadcastSavedPageChangedToPopup(result.pageKey);
@@ -1209,20 +1216,21 @@ async function handleAddPageManual({ rawUrl, gainPercent, customName }) {
  * Bulk-imports saved pages from a local JSON file the options page's Import
  * button already read and parsed - this handler never fetches, opens, or
  * visits any of them. Every entry is independently canonicalized (through
- * the same single canonical matcher every other exact-match decision uses)
- * and turned into a well-formed schema-6 record; a malformed pageKey or an
- * out-of-range volume fails ONLY that entry with a structured per-entry
- * result, exactly like bulk delete/reset - one bad row in an imported file
- * never blocks the rest. Every entry that resolves cleanly is written in a
- * single batched storage commit (settingsStore.importSavedPages), and - since
+ * the same canonical rule builder every other saved-rule decision uses)
+ * and turned into a well-formed schema-6 record. A malformed pageKey fails
+ * only that entry with a structured per-entry result, while numeric volumes
+ * are rounded and clamped to the supported range and metadata is sanitized.
+ * One bad row in an imported file never blocks the rest. Every entry that
+ * resolves cleanly is written in a single batched storage commit
+ * (settingsStore.importSavedPages), and - since
  * import is an explicit, user-initiated restore rather than a passive
- * re-save - OVERWRITES any existing record for that exact pageKey, unlike
+ * re-save - OVERWRITES any existing record for that saved rule key, unlike
  * ADD_PAGE_MANUAL's idempotent-volume behavior.
  */
 async function handleImportSavedPages({ entries }) {
   await ensureReconciled();
   const prepared = entries.map((entry) => {
-    const canonical = canonicalizePageKey(entry.pageKey);
+    const canonical = canonicalizeSavedPageRule(entry.pageKey, entry.matchMode);
     if (!canonical.ok) {
       return { pageKey: entry.pageKey, ok: false, error: { code: canonical.code, message: describeUrlErrorCode(canonical.code) } };
     }
@@ -1232,6 +1240,7 @@ async function handleImportSavedPages({ entries }) {
       volumePercent: clamped,
       titleSnapshot: entry.titleSnapshot,
       customName: entry.customName,
+      matchMode: canonical.matchMode,
     });
     if (record === null) {
       // Unreachable in practice (clampGainPercent above already guarantees a
@@ -1302,8 +1311,9 @@ async function stopSnapshotSessions(predicate, reason) {
  * page), and no other exact URL - same hostname or not - is affected.
  */
 async function deleteOneSavedPage(pageKey) {
+  const savedPages = await settingsStore.getSavedPages();
   const stopResult = await stopSnapshotSessions(
-    (entry) => entry.pageKey === pageKey,
+    (entry) => entry.pageKey && findSavedPageMatch(savedPages, entry.pageKey)?.pageKey === pageKey,
     SESSION_STOP_REASONS.REMOVED_FROM_SAVED_PAGES
   );
   if (!stopResult.ok) {
@@ -1332,13 +1342,14 @@ async function handleRemoveSavedPage({ pageKey }) {
  */
 async function handleDeleteSelectedSavedPages({ pageKeys }) {
   await ensureReconciled();
+  const savedPages = await settingsStore.getSavedPages();
   // Each pageKey is an exact, distinct page - no two selected pageKeys can
   // ever share a live session's tabId (a session's pageKey is immutable and
   // unique to its tab) - so tearing them down is embarrassingly parallel.
   const teardownOutcomes = await Promise.all(
     pageKeys.map(async (pageKey) => {
       const stopResult = await stopSnapshotSessions(
-        (entry) => entry.pageKey === pageKey,
+        (entry) => entry.pageKey && findSavedPageMatch(savedPages, entry.pageKey)?.pageKey === pageKey,
         SESSION_STOP_REASONS.REMOVED_FROM_SAVED_PAGES
       );
       return stopResult.ok ? { pageKey, ok: true } : { pageKey, ok: false, error: stopResult.error };
@@ -1381,10 +1392,11 @@ async function handleDeleteSelectedSavedPages({ pageKeys }) {
  * An inactive page (no matching snapshot) has nothing to confirm and is
  * immediately clear to persist.
  */
-async function confirmResetTo100LiveGain(pageKey) {
-  const snapshot = [...sessions.entries()].filter(
-    ([, entry]) => entry.pageKey === pageKey && entry.state === 'active'
-  );
+async function confirmResetTo100LiveGain(pageKey, savedPages) {
+  const snapshot = [...sessions.entries()].filter(([, entry]) => {
+    if (entry.state !== 'active' || !entry.pageKey) return false;
+    return findSavedPageMatch(savedPages, entry.pageKey)?.pageKey === pageKey;
+  });
 
   // Distinct tabIds (every entry here shares this pageKey but not a tabId),
   // so their live-gain confirmations are independent and run concurrently.
@@ -1415,10 +1427,11 @@ async function confirmResetTo100LiveGain(pageKey) {
  */
 async function handleResetSelectedSavedPagesTo100({ pageKeys }) {
   await ensureReconciled();
+  const savedPages = await settingsStore.getSavedPages();
   // Same independence argument as handleDeleteSelectedSavedPages: distinct
   // exact pageKeys can never share a session's tabId, so confirming their
   // live gain is safe to run concurrently.
-  const liveOutcomes = await Promise.all(pageKeys.map((pageKey) => confirmResetTo100LiveGain(pageKey)));
+  const liveOutcomes = await Promise.all(pageKeys.map((pageKey) => confirmResetTo100LiveGain(pageKey, savedPages)));
 
   const toPersist = liveOutcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.pageKey);
   const { updated } =
@@ -1498,7 +1511,8 @@ async function handleUpdateSavedPageVolume({ pageKey, gainPercent }) {
   if (result.aborted) {
     return { ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
   }
-  await propagateGainToSessionsSharingPageKey(pageKey, clamped);
+  const savedPages = await settingsStore.getSavedPages();
+  await propagateGainToSessionsUsingSavedRule(pageKey, clamped, savedPages);
   broadcastSavedPagesChanged();
   // Notify any popup open on this exact page: an ACTIVE tab already got its
   // TAB_STATE_CHANGED from propagateGainToSessionsSharingPageKey above; this
@@ -1529,7 +1543,11 @@ async function handleSavedPageLiveGain({ pageKey, gainPercent }) {
   if (clamped === null) {
     return { ok: false, error: { code: ERROR_CODES.INVALID_MESSAGE, message: 'Invalid gain value.' } };
   }
-  await propagateGainToSessionsSharingPageKey(pageKey, clamped);
+  const savedPages = await settingsStore.getSavedPages();
+  if (!savedPages[pageKey]) {
+    return { ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
+  }
+  await propagateGainToSessionsUsingSavedRule(pageKey, clamped, savedPages);
   return { ok: true, data: { pageKey, gainPercent: clamped } };
 }
 
@@ -1693,7 +1711,9 @@ async function activatePageAudio(tabId, operationToken, gainPercent) {
         operationToken,
         gainPercent,
       });
-      if (!response.ok || !response.data) return { inaccessible: false };
+      if (!response.ok || !isValidPageAudioSnapshot(response.data, operationToken)) {
+        return { inaccessible: false };
+      }
 
       const data = response.data;
       pageAudioFrames.setFrame(tabId, frameId, {
@@ -1744,7 +1764,7 @@ async function setPageAudioGain(tabId, operationToken, gainPercent) {
         operationToken,
         gainPercent,
       });
-      if (response.ok && response.data && !response.data.rejected) {
+      if (response.ok && isValidPageAudioSnapshot(response.data, operationToken)) {
         pageAudioFrames.updateFrameState(tabId, frame.frameId, operationToken, {
           gainPercent,
           state: response.data.state,
@@ -1921,7 +1941,7 @@ async function handleSetTabGain({ tabId, gainPercent, expectedOperationId }) {
     const currentPage = sessions.get(tabId);
     if (currentPage && currentPage.operationId === operationId) {
       currentPage.gainPercent = clamped;
-      broadcastSavedPageLiveGainToOptions(currentPage.pageKey, clamped);
+      broadcastSessionLiveGainToOptions(currentPage, clamped);
     }
     return { ok: true, data: { tabId, gainPercent: clamped } };
   }
@@ -1952,7 +1972,7 @@ async function handleSetTabGain({ tabId, gainPercent, expectedOperationId }) {
     // never persisting anything. A stale/unconfirmed response never reaches
     // here (the confirmation gate above already returned), so a Saved-pages
     // row is only ever moved by a live gain the offscreen document confirmed.
-    broadcastSavedPageLiveGainToOptions(current.pageKey, clamped);
+    broadcastSessionLiveGainToOptions(current, clamped);
   }
   return { ok: true, data: { tabId, gainPercent: clamped } };
 }
@@ -1982,6 +2002,12 @@ async function handlePersistPageVolume({ tabId, gainPercent, expectedOperationId
 
   const operationId = entry.operationId;
   const pageKey = entry.pageKey;
+  const savedPages = await settingsStore.getSavedPages();
+  const savedMatch = findSavedPageMatch(savedPages, pageKey);
+  if (!savedMatch) {
+    return { ok: false, error: { code: ERROR_CODES.PAGE_NOT_SAVED, message: 'This page is not saved.' } };
+  }
+  const savedPageKey = savedMatch.pageKey;
 
   function stillActiveForThisOperation() {
     const current = sessions.get(tabId);
@@ -1990,7 +2016,7 @@ async function handlePersistPageVolume({ tabId, gainPercent, expectedOperationId
     );
   }
 
-  const result = await settingsStore.persistExistingVolumeIfPreconditionHolds(pageKey, clamped, stillActiveForThisOperation);
+  const result = await settingsStore.persistExistingVolumeIfPreconditionHolds(savedPageKey, clamped, stillActiveForThisOperation);
 
   if (result.aborted) {
     const notSaved = result.code === 'PAGE_NOT_SAVED';
@@ -2002,7 +2028,8 @@ async function handlePersistPageVolume({ tabId, gainPercent, expectedOperationId
     };
   }
 
-  await propagateGainToSessionsSharingPageKey(pageKey, clamped);
+  const updatedSavedPages = await settingsStore.getSavedPages();
+  await propagateGainToSessionsUsingSavedRule(savedPageKey, clamped, updatedSavedPages);
 
   // After a successful storage commit, tell every open Saved-pages/options
   // view the authoritative new savedPages so the matching row slider and
@@ -2078,8 +2105,8 @@ async function handleMessage(message) {
 
 // An explicit, message-type-specific allowed-sender matrix - rather than
 // accepting every regular command from either popup or options
-// indiscriminately, each message type is mapped to the exact single
-// context that protocol design ever legitimately sends it (see the
+// indiscriminately, each message type is mapped to the user-facing context
+// that protocol design legitimately sends it (see the
 // popup.js/options.js message call sites). All three possible senders are
 // real page/frame extension contexts, where Chrome's MessageSender.url is
 // reliably present - unlike validateServiceWorkerOriginatedSender (used by
@@ -2088,7 +2115,6 @@ async function handleMessage(message) {
 const POPUP_ONLY_MESSAGE_TYPES = new Set([
   MESSAGE_TYPES.GET_TAB_STATE,
   MESSAGE_TYPES.ADD_CURRENT_PAGE,
-  MESSAGE_TYPES.ADD_PAGE_MANUAL,
   MESSAGE_TYPES.START_PAGE_AUDIO,
   MESSAGE_TYPES.START_CAPTURE,
   MESSAGE_TYPES.STOP_CAPTURE,
@@ -2107,6 +2133,7 @@ const OPTIONS_ONLY_MESSAGE_TYPES = new Set([
   MESSAGE_TYPES.IMPORT_SAVED_PAGES,
 ]);
 const OFFSCREEN_ONLY_MESSAGE_TYPES = new Set([MESSAGE_TYPES.SESSION_STOPPED, MESSAGE_TYPES.SESSION_ERROR]);
+const POPUP_OR_OPTIONS_MESSAGE_TYPES = new Set([MESSAGE_TYPES.ADD_PAGE_MANUAL]);
 
 function validateServiceWorkerSender(sender, message) {
   if (OFFSCREEN_ONLY_MESSAGE_TYPES.has(message.type)) {
@@ -2117,6 +2144,9 @@ function validateServiceWorkerSender(sender, message) {
   }
   if (OPTIONS_ONLY_MESSAGE_TYPES.has(message.type)) {
     return validatePageContextSender(sender, TARGETS.OPTIONS);
+  }
+  if (POPUP_OR_OPTIONS_MESSAGE_TYPES.has(message.type)) {
+    return validatePageContextSender(sender, TARGETS.POPUP) || validatePageContextSender(sender, TARGETS.OPTIONS);
   }
   // An unrecognized message type - validateMessage() already rejects these
   // before validateSender ever runs in practice, but fail closed regardless.
@@ -2156,15 +2186,18 @@ async function handleFullNavigation(details) {
     await maybeAutoResumeSavedPage(details.tabId, details.url);
     return;
   }
-  await requestOffscreenTeardown(details.tabId, {
+  const teardown = await requestOffscreenTeardown(details.tabId, {
     operationId: entry.operationId,
     reason: SESSION_STOP_REASONS.FULL_NAVIGATION,
   });
+  if (teardown.ok) {
+    await maybeAutoResumeSavedPage(details.tabId, details.url);
+  }
 }
 
 /**
  * Auto-resume for a freshly-committed top-level page: if the tab has no live
- * session and its exact URL matches a saved page, start the page-audio
+ * session and its exact URL matches a saved rule, start the page-audio
  * backend at the saved volume. Only the page-audio (fullscreen-compatible)
  * backend can be resumed this way - tab capture requires a genuine user
  * gesture on every call and is deliberately never started here.
@@ -2184,8 +2217,8 @@ async function maybeAutoResumeSavedPage(tabId, url) {
   if (!result.ok) return;
 
   const savedPages = await settingsStore.getSavedPages();
-  const savedRecord = savedPages[result.pageKey];
-  if (!savedRecord) return;
+  const savedMatch = findSavedPageMatch(savedPages, result.pageKey);
+  if (!savedMatch) return;
 
   // A navigation could have superseded this one while we read storage.
   if (sessions.has(tabId)) return;
@@ -2193,7 +2226,7 @@ async function maybeAutoResumeSavedPage(tabId, url) {
   await handleStartPageAudio({
     tabId,
     expectedPageKey: result.pageKey,
-    initialGainPercent: savedRecord.volumePercent,
+    initialGainPercent: savedMatch.record.volumePercent,
   });
 }
 
@@ -2201,7 +2234,13 @@ async function handleSameDocumentNavigation(details) {
   if (details.frameId !== 0) return;
   await ensureReconciled();
   const entry = sessions.get(details.tabId);
-  if (!entry) return;
+  // A saved SPA route or fragment can become current without a full document
+  // commit. Treat it like the full-navigation auto-resume path so exact-page
+  // preferences work consistently for both kinds of navigation.
+  if (!entry) {
+    await maybeAutoResumeSavedPage(details.tabId, details.url);
+    return;
+  }
   // Same-document route changes keep the document (and therefore the page
   // controller) alive, so frame records survive here - only a genuine exact
   // pageKey change below tears the session down.
@@ -2209,10 +2248,28 @@ async function handleSameDocumentNavigation(details) {
     const result = canonicalizePageKey(details.url);
     if (result.ok && result.pageKey === entry.pageKey) return;
   }
-  await requestOffscreenTeardown(details.tabId, {
+  const teardown = await requestOffscreenTeardown(details.tabId, {
     operationId: entry.operationId,
     reason: SESSION_STOP_REASONS.SAME_DOCUMENT_PAGE_CHANGED,
   });
+
+  // Only resume after the old exact-page session has been positively removed.
+  // If teardown failed, leaving its state alone is safer than starting a
+  // second operation over an ambiguous live backend.
+  if (teardown.ok) {
+    await maybeAutoResumeSavedPage(details.tabId, details.url);
+  }
+}
+
+async function broadcastSessionLiveGainToOptions(entry, gainPercent) {
+  try {
+    if (!entry?.pageKey) return;
+    const savedPages = await settingsStore.getSavedPages();
+    const savedMatch = findSavedPageMatch(savedPages, entry.pageKey);
+    if (savedMatch) broadcastSavedPageLiveGainToOptions(savedMatch.pageKey, gainPercent);
+  } catch {
+    // Best-effort only - a live gain change must not fail because UI sync did.
+  }
 }
 
 async function handleTabRemoved(tabId) {

@@ -132,6 +132,13 @@ export const SESSION_STOP_REASONS = Object.freeze({
 
 export const DEFAULT_VOLUME_PERCENT = 100;
 
+export const SAVED_PAGE_MATCH_MODES = Object.freeze({
+  EXACT: 'exact',
+  PAGE: 'page',
+  PATH: 'path',
+  SITE: 'site',
+});
+
 // Saved-page metadata limits (schema 6). Both are local-only display strings;
 // neither is ever fetched, and neither affects exact-page matching.
 export const MAX_TITLE_SNAPSHOT_LENGTH = 200;
@@ -141,6 +148,11 @@ export const MAX_CUSTOM_NAME_LENGTH = 120;
 // above any realistic saved-page count, but bounded so a malformed or hostile
 // options-page payload can never enqueue unbounded work in the service worker.
 export const MAX_BULK_PAGE_KEYS = 1000;
+// Bound local import before File.text()/JSON.parse() so an accidentally
+// selected huge JSON file cannot freeze or exhaust the Saved pages view.
+// Five MiB still allows large multi-batch imports, including long exact URLs
+// and the bounded title/name metadata.
+export const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024;
 export const MIN_GAIN_PERCENT = 0;
 // GainNode gain is gainPercent/100, so 100% = 1.0, 200% = 2.0, 300% = 3.0.
 // There is no compressor/limiter anywhere - gain above 100% is plain

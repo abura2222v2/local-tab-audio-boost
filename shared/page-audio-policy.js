@@ -106,6 +106,37 @@ export function isValidBridgeCommand(command) {
   }
 }
 
+/**
+ * Validates the complete snapshot returned across the MAIN-world DOM bridge.
+ * Page scripts share that world and DOM event channel, so the service worker
+ * must treat every reply as untrusted input even though the controller itself
+ * is a packaged file. This cannot prevent a hostile page from interfering
+ * with its own audio, but it prevents malformed replies from corrupting the
+ * extension's derived session state.
+ */
+export function isValidPageAudioSnapshot(value, expectedOperationToken) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  if (value.operationToken !== expectedOperationToken) return false;
+  if (!isValidGainPercentValue(value.gainPercent)) return false;
+  if (!Number.isInteger(value.attachedCount) || value.attachedCount < 0) return false;
+  if (!Number.isInteger(value.reinstallCount) || value.reinstallCount < 0) return false;
+
+  const controllerStates = new Set([
+    PAGE_AUDIO_STATES.ACTIVE_WITH_MEDIA,
+    PAGE_AUDIO_STATES.ARMED_WAITING_FOR_MEDIA,
+    PAGE_AUDIO_STATES.UNSUPPORTED_MEDIA,
+    PAGE_AUDIO_STATES.CONTEXT_SUSPENDED,
+    PAGE_AUDIO_STATES.ATTACHMENT_FAILED,
+  ]);
+  if (!controllerStates.has(value.state)) return false;
+
+  const contextStates = new Set(['none', 'running', 'suspended', 'closed']);
+  if (!contextStates.has(value.contextState)) return false;
+
+  const refusalValues = new Set(Object.values(ATTACH_REFUSAL));
+  return Array.isArray(value.refusals) && value.refusals.every((reason) => refusalValues.has(reason));
+}
+
 // --- Media attachment safety -------------------------------------------------
 
 /** Structured reasons an element cannot be safely routed. */

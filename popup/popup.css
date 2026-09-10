@@ -147,7 +147,8 @@ body {
 .popup__button:focus-visible,
 #gain-slider:focus-visible,
 #manual-volume-input:focus-visible,
-#manual-url-input:focus-visible {
+#manual-url-input:focus-visible,
+#manual-name-input:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
@@ -203,7 +204,8 @@ body.busy .popup__button {
   margin-top: 6px;
 }
 
-#manual-url-input {
+#manual-url-input,
+#manual-name-input {
   padding: 8px 10px;
   font-size: 13px;
   border: 1px solid var(--border);

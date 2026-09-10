@@ -8,10 +8,11 @@
 // the MAIN world and returns the controller's structured reply.
 //
 // Trust direction matters here: the service worker is the sole authority. This
-// bridge never accepts a pageKey, tabId, operationId, URL, or permission
-// decision from the page, never touches chrome.storage, and never exposes any
-// privileged Chrome API to page code. Commands only ever flow extension ->
-// page; the page can only answer the specific request it was asked.
+// bridge never accepts a pageKey, tabId, URL, or permission decision from the
+// page, never touches chrome.storage, and never exposes any privileged Chrome
+// API to page code. The DOM event channel and MAIN world are visible to page
+// scripts, so replies remain untrusted and are shape-validated by the service
+// worker before they affect its derived session state.
 
 (() => {
   'use strict';

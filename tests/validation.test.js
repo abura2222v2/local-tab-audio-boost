@@ -410,6 +410,12 @@ test('ADD_PAGE_MANUAL accepts an optional numeric gainPercent (the manual-add mo
   const withGain = { ...withoutGain, payload: { rawUrl: 'https://example.com/', gainPercent: 80 } };
   assert.equal(validateMessage(withGain).ok, true);
 
+  const withScope = { ...withoutGain, payload: { rawUrl: 'https://example.com/section', matchMode: 'path' } };
+  assert.equal(validateMessage(withScope).ok, true);
+
+  const withBadScope = { ...withoutGain, payload: { rawUrl: 'https://example.com/', matchMode: 'wildcard' } };
+  assert.equal(validateMessage(withBadScope).ok, false);
+
   const withBadGain = { ...withoutGain, payload: { rawUrl: 'https://example.com/', gainPercent: '80' } };
   assert.equal(validateMessage(withBadGain).ok, false);
 });

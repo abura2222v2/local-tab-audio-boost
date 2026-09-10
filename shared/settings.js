@@ -18,6 +18,7 @@ import {
 } from './constants.js';
 import { normalizeSavedPages } from './validation.js';
 import { createSavedPageRecord, sanitizeTitleSnapshot, sanitizeCustomName } from './saved-page-metadata.js';
+import { normalizeSavedPageMatchMode } from './saved-page-rules.js';
 
 // A minimal, zero-dependency in-process promise chain that serializes every
 // storage mutation relative to every other one, within the current
@@ -226,6 +227,9 @@ export function addSavedPage(pageKey, volumePercent, metadata = {}) {
     const existing = pages[pageKey];
     const incomingTitle = sanitizeTitleSnapshot(metadata.titleSnapshot);
     const incomingName = sanitizeCustomName(metadata.customName);
+    const nextMatchMode = normalizeSavedPageMatchMode(
+      metadata.matchMode === undefined ? existing?.matchMode : metadata.matchMode
+    );
 
     const nextVolume = existing ? existing.volumePercent : volumePercent;
     const nextTitle = incomingTitle || (existing ? existing.titleSnapshot : '');
@@ -235,6 +239,7 @@ export function addSavedPage(pageKey, volumePercent, metadata = {}) {
       volumePercent: nextVolume,
       titleSnapshot: nextTitle,
       customName: nextName,
+      matchMode: nextMatchMode,
     });
     if (record === null) {
       return { pageKey, volumePercent: existing ? existing.volumePercent : null, aborted: true, code: 'INVALID_VOLUME' };
@@ -244,12 +249,19 @@ export function addSavedPage(pageKey, volumePercent, metadata = {}) {
       existing &&
       existing.volumePercent === record.volumePercent &&
       existing.titleSnapshot === record.titleSnapshot &&
-      existing.customName === record.customName;
+      existing.customName === record.customName &&
+      normalizeSavedPageMatchMode(existing.matchMode) === normalizeSavedPageMatchMode(record.matchMode);
     if (!unchanged) {
       pages[pageKey] = record;
       await writeSavedPages(pages);
     }
-    return { pageKey, volumePercent: record.volumePercent, titleSnapshot: record.titleSnapshot, customName: record.customName };
+    return {
+      pageKey,
+      volumePercent: record.volumePercent,
+      titleSnapshot: record.titleSnapshot,
+      customName: record.customName,
+      matchMode: normalizeSavedPageMatchMode(record.matchMode),
+    };
   });
 }
 
@@ -275,11 +287,7 @@ export function renameSavedPage(pageKey, customName) {
     if (existing.customName === nextName) {
       return { aborted: false, pageKey, customName: nextName };
     }
-    pages[pageKey] = {
-      volumePercent: existing.volumePercent,
-      titleSnapshot: existing.titleSnapshot,
-      customName: nextName,
-    };
+    pages[pageKey] = { ...existing, customName: nextName };
     await writeSavedPages(pages);
     return { aborted: false, pageKey, customName: nextName };
   });

@@ -14,6 +14,7 @@ import {
 } from './constants.js';
 import { canonicalizePageKey } from './urls.js';
 import { normalizeSavedPageRecord } from './saved-page-metadata.js';
+import { isValidSavedPageMatchMode, canonicalizeSavedPageRule } from './saved-page-rules.js';
 
 export function isValidTarget(value) {
   return Object.values(TARGETS).includes(value);
@@ -113,7 +114,8 @@ const SERVICE_WORKER_PAYLOAD_VALIDATORS = {
     isPlainObject(p) &&
     isNonEmptyString(p.rawUrl) &&
     (p.gainPercent === undefined || typeof p.gainPercent === 'number') &&
-    (p.customName === undefined || (typeof p.customName === 'string' && p.customName.length <= MAX_CUSTOM_NAME_LENGTH)),
+    (p.customName === undefined || (typeof p.customName === 'string' && p.customName.length <= MAX_CUSTOM_NAME_LENGTH)) &&
+    (p.matchMode === undefined || isValidSavedPageMatchMode(p.matchMode)),
   [MESSAGE_TYPES.REMOVE_SAVED_PAGE]: (p) => isPlainObject(p) && isNonEmptyString(p.pageKey),
   [MESSAGE_TYPES.CLEAR_SAVED_PAGES]: (p) => isPlainObject(p),
   // Saved-pages-view -> service worker, direct pageKey update - never
@@ -280,7 +282,7 @@ export function normalizeSavedPages(value) {
   for (const [rawKey, storedValue] of Object.entries(value)) {
     const record = normalizeSavedPageRecord(storedValue);
     if (record === null) continue;
-    const canonical = canonicalizePageKey(rawKey);
+    const canonical = canonicalizeSavedPageRule(rawKey, record.matchMode);
     if (!canonical.ok) continue;
     if (!(canonical.pageKey in result)) {
       result[canonical.pageKey] = record;
@@ -331,6 +333,7 @@ export function isValidImportEntriesList(value) {
     if (!isPlainObject(entry)) return false;
     if (!isNonEmptyString(entry.pageKey)) return false;
     if (entry.volumePercent !== undefined && typeof entry.volumePercent !== 'number') return false;
+    if (entry.matchMode !== undefined && !isValidSavedPageMatchMode(entry.matchMode)) return false;
     if (
       entry.titleSnapshot !== undefined &&
       (typeof entry.titleSnapshot !== 'string' || entry.titleSnapshot.length > MAX_TITLE_SNAPSHOT_LENGTH)

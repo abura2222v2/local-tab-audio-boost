@@ -4,18 +4,28 @@
 // content script. Every display name is derived ONLY from data already stored
 // locally (customName / titleSnapshot) or from the pageKey's own text.
 //
-// A schema-6 saved-page record is exactly:
-//   { volumePercent: integer 0-300, titleSnapshot: string, customName: string }
+// A schema-6 saved-page record contains:
+//   { volumePercent: integer 0-300, titleSnapshot: string, customName: string,
+//     matchMode?: 'page'|'path'|'site' }
+// A missing matchMode deliberately means the legacy/default 'exact' mode, so
+// existing stored records remain valid without a migration or rewrite.
 //
 //  - volumePercent is the only field that affects audio;
 //  - titleSnapshot is a local snapshot of the tab's title, taken by the
 //    service worker at "Add this page" time (never supplied by the popup);
 //  - customName is an optional user override, set only via Rename or the
 //    "Add URL manually" name field.
-// Neither metadata field ever affects exact-page matching - the pageKey alone
-// does, and this module never modifies a pageKey.
+// Display metadata never affects matching. matchMode is the only optional
+// field that broadens how the stored canonical pageKey is interpreted.
 
-import { MAX_TITLE_SNAPSHOT_LENGTH, MAX_CUSTOM_NAME_LENGTH, MIN_GAIN_PERCENT, MAX_GAIN_PERCENT } from './constants.js';
+import {
+  MAX_TITLE_SNAPSHOT_LENGTH,
+  MAX_CUSTOM_NAME_LENGTH,
+  MIN_GAIN_PERCENT,
+  MAX_GAIN_PERCENT,
+  SAVED_PAGE_MATCH_MODES,
+} from './constants.js';
+import { normalizeSavedPageMatchMode } from './saved-page-rules.js';
 
 // Control characters (C0 and C1, including DEL) are stripped from every stored
 // display string, so a title containing newlines/escapes can never corrupt the
@@ -82,13 +92,16 @@ function isValidVolumePercent(value) {
  * always sanitized; an invalid volume yields null so the caller can drop the
  * whole record rather than store a half-valid one.
  */
-export function createSavedPageRecord({ volumePercent, titleSnapshot = '', customName = '' } = {}) {
+export function createSavedPageRecord({ volumePercent, titleSnapshot = '', customName = '', matchMode } = {}) {
   if (!isValidVolumePercent(volumePercent)) return null;
-  return {
+  const record = {
     volumePercent,
     titleSnapshot: sanitizeTitleSnapshot(titleSnapshot),
     customName: sanitizeCustomName(customName),
   };
+  const normalizedMode = normalizeSavedPageMatchMode(matchMode);
+  if (normalizedMode !== SAVED_PAGE_MATCH_MODES.EXACT) record.matchMode = normalizedMode;
+  return record;
 }
 
 /**
@@ -100,7 +113,7 @@ export function createSavedPageRecord({ volumePercent, titleSnapshot = '', custo
  *  - a schema-6 object         -> validated + sanitized, unknown properties dropped
  *
  * Unrecognized properties are never carried through: the returned record is
- * rebuilt from exactly the three known fields, so nothing a malformed or
+ * rebuilt from only the known fields, so nothing a malformed or
  * hostile storage value contains can survive into the runtime representation.
  * A missing/invalid metadata field becomes the empty string; an out-of-range
  * or non-integer volume rejects the whole record (matching schema 5's existing
@@ -115,6 +128,7 @@ export function normalizeSavedPageRecord(value) {
     volumePercent: value.volumePercent,
     titleSnapshot: value.titleSnapshot,
     customName: value.customName,
+    matchMode: value.matchMode,
   });
 }
 
@@ -169,8 +183,8 @@ function tidyLabelSegment(segment) {
  * external service.
  *
  *   https://www.youtube.com/watch?v=abc  -> "youtube.com · watch"
- *   https://rezka.ag/series/thriller/19546-posledniy-kandidat-2016.html
- *                                        -> "rezka.ag · 19546-posledniy-kandidat-2016"
+ *   https://stream.example/series/thriller/last-candidate.html
+ *                                        -> "stream.example · last-candidate"
  *   https://example.com/                 -> "example.com"
  *
  * The leading "www." is removed from the DISPLAYED hostname only; the stored

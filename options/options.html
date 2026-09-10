@@ -10,23 +10,53 @@
   <h1>Saved pages</h1>
 
   <p class="options__warning" role="note">
-    Exact page addresses are stored locally. Avoid adding URLs that contain passwords,
+    Saved addresses and matching rules are stored locally. Avoid adding URLs that contain passwords,
     access tokens, or other secrets.
   </p>
 
   <p class="options__note" role="note">
-    Saving a page only stores its exact URL, a preferred volume, and an optional local
-    name - it never starts boosting on its own, and no page is ever fetched. Use the
-    popup's <strong>Enable boosting</strong> button (or its slider) on the page itself to
-    actually start a session. To save a new page, open the popup on that page and use
-    <strong>Add this page</strong> or <strong>Add URL manually</strong>.
+    Saving a rule stores its address, matching scope, preferred volume, and optional local name. It
+    does not immediately start boosting or fetch the page. When a matching address is
+    opened later, the saved volume resumes automatically when the player supports
+    fullscreen-compatible mode. You can also start or stop boosting from the popup.
   </p>
+
+  <form id="add-rule-form" class="options__add-form">
+    <h2 class="options__section-title">Add an address</h2>
+    <label class="options__field options__field--wide" for="add-url-input">
+      <span>URL</span>
+      <input id="add-url-input" type="url" placeholder="https://example.com/page" required spellcheck="false" />
+    </label>
+    <label class="options__field" for="add-scope-select">
+      <span>Apply to</span>
+      <select id="add-scope-select">
+        <option value="exact">Only this exact address</option>
+        <option value="page">This page, including episode fragments</option>
+        <option value="path">This section and its subpages</option>
+        <option value="site">The entire website</option>
+      </select>
+    </label>
+    <label class="options__field" for="add-name-input">
+      <span>Local name (optional)</span>
+      <input id="add-name-input" type="text" maxlength="120" autocomplete="off" />
+    </label>
+    <label class="options__field" for="add-volume-input">
+      <span>Volume</span>
+      <span class="options__volume-input-row">
+        <input id="add-volume-input" type="range" min="0" max="300" step="1" value="100" />
+        <output id="add-volume-output" for="add-volume-input">100%</output>
+      </span>
+    </label>
+    <div class="options__add-actions">
+      <button type="submit" class="options__button options__button--primary">Add saved rule</button>
+    </div>
+  </form>
 
   <p class="options__note" role="note">
     <strong>Export saved pages</strong> saves every saved page to a local JSON file.
     <strong>Import saved pages</strong> reads a local JSON file (this extension's own export,
-    or a hand-edited list with the same shape) and adds its pages - an already-saved exact
-    URL is overwritten with the imported values. Neither ever touches the network.
+    or a hand-edited list with the same shape) and adds its rules. An already-saved rule
+    is overwritten with the imported values. Neither ever touches the network.
   </p>
 
   <!--

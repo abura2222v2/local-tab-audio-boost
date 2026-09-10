@@ -3,6 +3,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "audit": "node scripts/audit.mjs"
+    "audit": "node scripts/audit.mjs",
+    "test:manual-server": "node scripts/manual-test-server.mjs"
   }
 }

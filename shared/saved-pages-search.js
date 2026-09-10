@@ -9,7 +9,7 @@
 //   - a saved page matches when EVERY token appears somewhere in that page's
 //     combined normalized searchable text;
 //   - token ORDER does not matter, and tokens need not be adjacent, so
-//     "rezka kandidat" matches a page whose hostname supplies "rezka" and
+//     "stream candidate" matches a page whose hostname supplies "stream" and
 //     whose path supplies "kandidat".
 //
 // Search only decides which rows are VISIBLE. It never changes exact-page

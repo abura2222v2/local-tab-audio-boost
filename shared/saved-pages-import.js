@@ -9,6 +9,8 @@
 // logic is unit-testable under plain Node, matching every other view-model
 // module in shared/.
 
+import { isValidSavedPageMatchMode } from './saved-page-rules.js';
+
 export const EXPORT_FORMAT = 'local-tab-audio-boost-saved-pages';
 export const EXPORT_FORMAT_VERSION = 1;
 
@@ -27,6 +29,7 @@ export function buildExportPayload(savedPages, now = new Date()) {
       volumePercent: record?.volumePercent,
       titleSnapshot: record?.titleSnapshot,
       customName: record?.customName,
+      ...(record?.matchMode ? { matchMode: record.matchMode } : {}),
     })),
   };
 }
@@ -51,9 +54,9 @@ export function extractRawImportEntries(parsed) {
  * handleImportSavedPages in service-worker.js), exactly like every other
  * saved-page mutation never trusts a client-supplied value as final.
  *
- * `maxCount` bounds the result so an oversized file degrades to "import the
- * first N entries" locally, rather than the whole request being rejected
- * outright by the service worker's own IMPORT_SAVED_PAGES payload bound.
+ * `maxCount` is optional. Callers that need a single bounded message can pass
+ * it; the Saved pages view omits it and divides the complete sanitized list
+ * into bounded service-worker messages instead.
  */
 export function sanitizeImportEntries(rawEntries, maxCount) {
   const list = Array.isArray(rawEntries) ? rawEntries : [];
@@ -64,6 +67,7 @@ export function sanitizeImportEntries(rawEntries, maxCount) {
       volumePercent: typeof entry.volumePercent === 'number' ? entry.volumePercent : undefined,
       titleSnapshot: typeof entry.titleSnapshot === 'string' ? entry.titleSnapshot : undefined,
       customName: typeof entry.customName === 'string' ? entry.customName : undefined,
+      ...(isValidSavedPageMatchMode(entry.matchMode) ? { matchMode: entry.matchMode } : {}),
     }));
   const entries = typeof maxCount === 'number' ? shaped.slice(0, maxCount) : shaped;
   return { entries, totalRawCount: list.length, droppedCount: list.length - entries.length };

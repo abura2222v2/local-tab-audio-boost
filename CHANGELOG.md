@@ -2,6 +2,28 @@
 
 User-visible changes only.
 
+## Unreleased
+
+- Added direct URL entry to the Saved pages view, with exact-address, page,
+  path-section, and whole-site matching scopes. More specific rules override
+  broader rules, and matching remains entirely local.
+
+- Saved volume now resumes after History API and fragment navigation on
+  single-page applications, including when moving between two saved routes.
+- Fullscreen-compatible mode now notices media whose source is assigned after
+  its `<video>` or `<audio>` element was already added to the page, including
+  a ready `<source>` appended to an existing player.
+- The manual-add dialog now keeps keyboard focus inside the dialog, restores
+  focus when it closes, and styles the optional name field consistently.
+- Import now rejects files larger than 5 MB before parsing, imports large lists
+  in bounded batches, and keeps the final count of skipped malformed entries
+  visible.
+- Clarified the Saved pages and privacy text to accurately describe automatic
+  resume and both local audio-processing modes.
+- MAIN-world audio replies are now fully validated before they can update the
+  service worker's session state, and the security documentation now states
+  the web-page trust boundary explicitly.
+
 ## 0.5.0
 
 - Added **Export saved pages** and **Import saved pages** to the Saved pages

@@ -99,9 +99,75 @@ h1 {
 }
 
 .options__button:focus-visible,
-.options__row-slider:focus-visible {
+.options__row-slider:focus-visible,
+.options__add-form input:focus-visible,
+.options__add-form select:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+.options__add-form {
+  margin: 20px 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.options__section-title {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 15px;
+}
+
+.options__field {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.options__field--wide,
+.options__add-actions {
+  grid-column: 1 / -1;
+}
+
+.options__field input:not([type='range']),
+.options__field select {
+  width: 100%;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.options__volume-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.options__volume-input-row input {
+  flex: 1 1 auto;
+  accent-color: var(--accent);
+}
+
+.options__volume-input-row output {
+  min-width: 38px;
+  color: var(--fg);
+  text-align: right;
+}
+
+.options__add-actions {
+  display: flex;
+  justify-content: flex-start;
 }
 
 /*
@@ -302,6 +368,15 @@ h1 {
   color: var(--muted);
 }
 
+.options__scope {
+  width: fit-content;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
 /* An active row is marked with text, never by color alone. */
 .options__status--active {
   color: var(--accent);
@@ -346,6 +421,18 @@ h1 {
 .options__small-button:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+@media (max-width: 520px) {
+  .options__add-form {
+    grid-template-columns: 1fr;
+  }
+
+  .options__field,
+  .options__field--wide,
+  .options__add-actions {
+    grid-column: 1;
+  }
 }
 
 /* --- Destructive actions (collapsed by default) --- */

@@ -17,12 +17,12 @@ import {
 const rec = (volumePercent = 100, titleSnapshot = '', customName = '') => ({ volumePercent, titleSnapshot, customName });
 
 const YOUTUBE = 'https://www.youtube.com/watch?v=abc';
-const REZKA = 'https://rezka.ag/series/thriller/19546-posledniy-kandidat-2016.html';
+const STREAM = 'https://stream.example/series/thriller/last-candidate.html';
 const PLAIN = 'https://example.com/';
 
 const PAGES = {
   [YOUTUBE]: rec(100),
-  [REZKA]: rec(209),
+  [STREAM]: rec(209),
   [PLAIN]: rec(150),
 };
 
@@ -39,7 +39,7 @@ test('search: normalization lowercases, trims, and applies Unicode NFKC', () => 
 });
 
 test('search: the query tokenizes on whitespace and URL separators', () => {
-  assert.deepEqual(tokenizeQuery('rezka kandidat'), ['rezka', 'kandidat']);
+  assert.deepEqual(tokenizeQuery('stream candidate'), ['stream', 'candidate']);
   assert.deepEqual(tokenizeQuery('youtube.com/watch'), ['youtube', 'com', 'watch']);
   assert.deepEqual(tokenizeQuery('a-b_c?d=e#f'), ['a', 'b', 'c', 'd', 'e', 'f']);
   assert.deepEqual(tokenizeQuery('   '), []);
@@ -63,18 +63,18 @@ test('search #20: "youtube" matches youtube.com', () => {
 });
 
 test('search #21: a word in the MIDDLE of a URL matches', () => {
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'thriller'), [REZKA]);
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'series'), [REZKA]);
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'thriller'), [STREAM]);
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'series'), [STREAM]);
 });
 
-test('search #22: "rezka kandidat" matches when the tokens come from SEPARATE fields', () => {
-  // "rezka" is only in the hostname; "kandidat" is only in the path slug.
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'rezka kandidat'), [REZKA]);
+test('search #22: "stream candidate" matches when the tokens come from SEPARATE fields', () => {
+  // "stream" is only in the hostname; "candidate" is only in the path slug.
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'stream candidate'), [STREAM]);
 });
 
 test('search #23: matching is case-insensitive', () => {
   assert.deepEqual(filterSavedPageKeys(PAGES, 'YOUTUBE'), [YOUTUBE]);
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'ReZkA KaNdIdAt'), [REZKA]);
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'StReAm CaNdIdAtE'), [STREAM]);
 });
 
 test('search #24: Unicode normalization lets differently-composed text match', () => {
@@ -94,13 +94,13 @@ test('search #25: percent-decoded text can match safely', () => {
 });
 
 test('search #26: token ORDER does not matter', () => {
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'kandidat rezka'), [REZKA]);
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'rezka kandidat'), [REZKA]);
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'candidate stream'), [STREAM]);
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'stream candidate'), [STREAM]);
 });
 
 test('search #27: missing ONE required token means no match (AND, not OR)', () => {
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'rezka nosuchtoken'), []);
-  assert.deepEqual(filterSavedPageKeys(PAGES, 'youtube rezka'), [], 'no single page contains both');
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'stream nosuchtoken'), []);
+  assert.deepEqual(filterSavedPageKeys(PAGES, 'youtube stream'), [], 'no single page contains both');
 });
 
 test('search #28: the query string and fragment are searchable', () => {
@@ -114,10 +114,10 @@ test('search #28: the query string and fragment are searchable', () => {
 test('search #29: searching never alters the exact pageKey', () => {
   const pages = { ...PAGES };
   const keysBefore = Object.keys(pages);
-  const results = filterSavedPageKeys(pages, 'rezka');
+  const results = filterSavedPageKeys(pages, 'stream');
   assert.deepEqual(Object.keys(pages), keysBefore, 'the input map is untouched');
-  assert.equal(results[0], REZKA, 'the returned key is the exact original string');
-  assert.equal(results[0].length, REZKA.length);
+  assert.equal(results[0], STREAM, 'the returned key is the exact original string');
+  assert.equal(results[0].length, STREAM.length);
 });
 
 test('search #30: an empty (or whitespace-only) query shows every record', () => {

@@ -335,28 +335,44 @@ globalThis.chrome = {
       const command = message?.command;
       if (!command) return { ok: false, reason: 'INVALID_COMMAND' };
 
+      const snapshot = () => ({
+        state: controller.state,
+        gainPercent: controller.gainPercent,
+        attachedCount:
+          controller.state === 'ACTIVE_WITH_MEDIA' || controller.state === 'CONTEXT_SUSPENDED' ? 1 : 0,
+        refusals: controller.state === 'UNSUPPORTED_MEDIA' ? ['CROSS_ORIGIN_NO_CORS'] : [],
+        contextState:
+          controller.state === 'ACTIVE_WITH_MEDIA'
+            ? 'running'
+            : controller.state === 'CONTEXT_SUSPENDED'
+              ? 'suspended'
+              : 'none',
+        operationToken: controller.operationToken,
+        reinstallCount: Math.max(0, controller.installed - 1),
+      });
+
       if (command.type === 'INSTALL') {
         controller.operationToken = command.operationToken;
         controller.gainPercent = command.gainPercent;
         controller.state = pageMediaState.get(tabId) ?? 'ACTIVE_WITH_MEDIA';
-        return { ok: true, data: { state: controller.state, gainPercent: command.gainPercent, refusals: controller.state === 'UNSUPPORTED_MEDIA' ? ['CROSS_ORIGIN_NO_CORS'] : [] } };
+        return { ok: true, data: snapshot() };
       }
       if (controller.operationToken !== command.operationToken) {
         return { ok: false, rejected: true, reason: 'STALE_OPERATION' };
       }
       if (command.type === 'SET_GAIN') {
         controller.gainPercent = command.gainPercent;
-        return { ok: true, data: { state: controller.state, gainPercent: command.gainPercent } };
+        return { ok: true, data: snapshot() };
       }
       if (command.type === 'RESET_TO_NEUTRAL') {
         controller.gainPercent = 100;
-        return { ok: true, data: { state: controller.state, gainPercent: 100 } };
+        return { ok: true, data: snapshot() };
       }
       if (command.type === 'DISPOSE_OBSERVERS') {
         controller.observersDisposed = true;
-        return { ok: true, data: { state: controller.state, gainPercent: controller.gainPercent } };
+        return { ok: true, data: snapshot() };
       }
-      return { ok: true, data: { state: controller.state, gainPercent: controller.gainPercent } };
+      return { ok: true, data: snapshot() };
     },
     async get(tabId) {
       if (tabsGetGates.has(tabId)) {
@@ -3058,9 +3074,9 @@ test('sync #9: a row commit for one exact URL never changes a different URL on t
 
 test('sync #10: a popup PERSIST commit on one site does not modify a saved row for a different exact pageKey', async () => {
   resetEverything();
-  const rezka = 'https://rezka.example/films/movie-1';
+  const mediaPage = 'https://media.example/films/movie-1';
   const otherSite = 'https://docs.example/c/abc';
-  await addAndAssertSaved(rezka, 150);
+  await addAndAssertSaved(mediaPage, 150);
   await addAndAssertSaved(otherSite, 100);
 
   const chatTab = freshTabId();
@@ -3072,12 +3088,12 @@ test('sync #10: a popup PERSIST commit on one site does not modify a saved row f
 
   const pages = await savedVolumes();
   assert.equal(pages[otherSite], 175, 'the page that was committed updated');
-  assert.equal(pages[rezka], 150, 'the saved Rezka row was NOT modified');
+  assert.equal(pages[mediaPage], 150, 'the unrelated saved media row was NOT modified');
 
-  // The SAVED_PAGES_CHANGED broadcast reflects the authoritative map: Rezka
-  // unchanged, the committed page updated.
+  // The SAVED_PAGES_CHANGED broadcast reflects the authoritative map: the
+  // unrelated media page is unchanged, and the committed page is updated.
   const last = broadcastsTo(TARGETS.OPTIONS, MESSAGE_TYPES.SAVED_PAGES_CHANGED).slice(-1)[0];
-  assert.equal(last.payload.savedPages[rezka].volumePercent, 150);
+  assert.equal(last.payload.savedPages[mediaPage].volumePercent, 150);
   assert.equal(last.payload.savedPages[otherSite].volumePercent, 175);
 });
 
@@ -3962,11 +3978,10 @@ test('r3fix6: an options-only command (GET_SAVED_PAGES) sent with the popup send
   assert.equal(response.error.code, ERROR_CODES.INVALID_MESSAGE);
 });
 
-test("r3fix6: a popup-only command (ADD_PAGE_MANUAL, the 'Add URL manually' modal) sent with the options sender is rejected, but succeeds from the popup", async () => {
+test('ADD_PAGE_MANUAL is accepted from both user-facing add forms, but not from another extension', async () => {
   resetEverything();
   const optionsAttempt = await send(MESSAGE_TYPES.ADD_PAGE_MANUAL, { rawUrl: 'https://manual-add.example/' }, OPTIONS_TEST_SENDER);
-  assert.equal(optionsAttempt.ok, false);
-  assert.equal(optionsAttempt.error.code, ERROR_CODES.INVALID_MESSAGE);
+  assert.equal(optionsAttempt.ok, true);
 
   const popupAttempt = await send(
     MESSAGE_TYPES.ADD_PAGE_MANUAL,
@@ -3974,6 +3989,14 @@ test("r3fix6: a popup-only command (ADD_PAGE_MANUAL, the 'Add URL manually' moda
     DEFAULT_TEST_SENDER
   );
   assert.equal(popupAttempt.ok, true);
+
+  const foreignAttempt = await send(
+    MESSAGE_TYPES.ADD_PAGE_MANUAL,
+    { rawUrl: 'https://foreign.example/' },
+    { id: 'another-extension', url: `chrome-extension://another-extension/options/options.html` }
+  );
+  assert.equal(foreignAttempt.ok, false);
+  assert.equal(foreignAttempt.error.code, ERROR_CODES.INVALID_MESSAGE);
 });
 
 test('a popup-only command (UPDATE_SAVED_PAGE_VOLUME is options-only, not popup) sent with the popup sender is rejected, but succeeds from options', async () => {
@@ -5559,6 +5582,28 @@ test('IMPORT_SAVED_PAGES: imports valid entries, canonicalizes pageKeys, default
   assert.equal('not a url' in pages, false, 'the invalid entry was never stored');
 });
 
+test('IMPORT_SAVED_PAGES: numeric volumes from a hand-edited file are rounded and clamped', async () => {
+  resetEverything();
+  const response = await send(
+    MESSAGE_TYPES.IMPORT_SAVED_PAGES,
+    {
+      entries: [
+        { pageKey: 'https://import-too-high.example/', volumePercent: 999 },
+        { pageKey: 'https://import-fraction.example/', volumePercent: 149.6 },
+        { pageKey: 'https://import-negative.example/', volumePercent: -20 },
+      ],
+    },
+    OPTIONS_TEST_SENDER
+  );
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.results.every((result) => result.ok), true);
+  const pages = await savedRecords();
+  assert.equal(pages['https://import-too-high.example/'].volumePercent, 300);
+  assert.equal(pages['https://import-fraction.example/'].volumePercent, 150);
+  assert.equal(pages['https://import-negative.example/'].volumePercent, 0);
+});
+
 test('IMPORT_SAVED_PAGES: importing an already-saved exact pageKey OVERWRITES its stored record', async () => {
   resetEverything();
   const pageKey = 'https://import-overwrite.example/';
@@ -5790,6 +5835,24 @@ test('page-audio #23/#25: compatibility mode starts ONLY from its own explicit m
   assert.equal(state.data.backend, 'tab-capture', 'the session reports the compatibility backend');
 });
 
+test('page-audio: a malformed MAIN-world snapshot cannot create a service-worker session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/untrusted-snapshot';
+  setTab(tabId, pageKey);
+  setPageMediaState(tabId, 'FORGED_STATE');
+
+  const response = await send(MESSAGE_TYPES.START_PAGE_AUDIO, {
+    tabId,
+    expectedPageKey: pageKey,
+    initialGainPercent: 180,
+  });
+
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, ERROR_CODES.PAGE_AUDIO_UNSUPPORTED);
+  assert.equal(sw.__getRuntimeStateForTests().sessions, 0);
+});
+
 test('page-audio #28: navigation invalidates the page-audio session and its frame records', async () => {
   resetEverything();
   const tabId = freshTabId();
@@ -5840,6 +5903,120 @@ test('auto-resume: a page the user never saved is never boosted on its own', asy
   assert.equal(executeScriptCalls.length, 0, 'nothing was injected for an unsaved page');
   const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
   assert.notEqual(state.data.state, 'active', 'an unsaved page stays inactive');
+  assert.equal(tabCaptureCalls, 0);
+});
+
+test('saved rules: a title-page rule matches fictional episode fragments and auto-resumes its volume', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const basePage = 'https://stream.example/series/science-fiction/snow-train.html';
+  const episode = `${basePage}#season:2-episode:10`;
+  const added = await send(
+    MESSAGE_TYPES.ADD_PAGE_MANUAL,
+    { rawUrl: basePage, matchMode: 'page', gainPercent: 185 },
+    OPTIONS_TEST_SENDER
+  );
+  assert.equal(added.ok, true);
+
+  setTab(tabId, episode, 'Episode 10');
+  await fireCommitted(tabId, episode);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.saved, true);
+  assert.equal(state.data.savedPageKey, basePage);
+  assert.equal(state.data.state, 'active');
+  assert.equal(pageGainFor(tabId), 185);
+});
+
+test('saved rules: exact episode overrides the whole-site default', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const episode = 'https://stream.example/series/science-fiction/title.html#season:2-episode:3';
+  await send(
+    MESSAGE_TYPES.ADD_PAGE_MANUAL,
+    { rawUrl: 'https://stream.example/', matchMode: 'site', gainPercent: 135 },
+    OPTIONS_TEST_SENDER
+  );
+  await send(
+    MESSAGE_TYPES.ADD_PAGE_MANUAL,
+    { rawUrl: episode, matchMode: 'exact', gainPercent: 225 },
+    OPTIONS_TEST_SENDER
+  );
+
+  setTab(tabId, episode);
+  await fireCommitted(tabId, episode);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.savedPageKey, episode);
+  assert.equal(pageGainFor(tabId), 225);
+});
+
+test('saved rules: persisting an episode slider updates its matching broad rule, not a new exact entry', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const siteRule = 'https://stream.example/';
+  const episode = 'https://stream.example/series/science-fiction/title.html#season:2-episode:4';
+  await send(
+    MESSAGE_TYPES.ADD_PAGE_MANUAL,
+    { rawUrl: siteRule, matchMode: 'site', gainPercent: 140 },
+    OPTIONS_TEST_SENDER
+  );
+  setTab(tabId, episode);
+  await fireCommitted(tabId, episode);
+  await tick(20);
+  const before = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+
+  const persisted = await send(MESSAGE_TYPES.PERSIST_PAGE_VOLUME, {
+    tabId,
+    gainPercent: 175,
+    expectedOperationId: before.data.operationId,
+  });
+  assert.equal(persisted.ok, true);
+
+  const saved = await send(MESSAGE_TYPES.GET_SAVED_PAGES, {}, OPTIONS_TEST_SENDER);
+  assert.equal(saved.data.savedPages[siteRule].volumePercent, 175);
+  assert.equal(saved.data.savedPages[episode], undefined);
+});
+
+test('auto-resume: a saved SPA route resumes when history navigation reaches its exact URL', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageKey = 'https://player.example/spa/episode-2';
+  await addAndAssertSaved(pageKey, 180);
+  setTab(tabId, pageKey, 'Episode 2');
+
+  // A History API navigation has no new document commit, but it still opens
+  // the exact saved page and must receive the same local preference.
+  await fireHistoryStateUpdated(tabId, pageKey);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active');
+  assert.equal(state.data.backend, 'page-audio');
+  assert.equal(pageGainFor(tabId), 180);
+  assert.equal(tabCaptureCalls, 0, 'SPA auto-resume never uses tab capture');
+});
+
+test('auto-resume: moving between saved SPA routes replaces the old exact-page session', async () => {
+  resetEverything();
+  const tabId = freshTabId();
+  const pageA = 'https://player.example/spa/episode-1';
+  const pageB = 'https://player.example/spa/episode-2';
+  await addAndAssertSaved(pageA, 130);
+  await addAndAssertSaved(pageB, 210);
+  setTab(tabId, pageA, 'Episode 1');
+  await enablePageAudio(tabId, 130);
+
+  setTab(tabId, pageB, 'Episode 2');
+  await fireHistoryStateUpdated(tabId, pageB);
+  await tick(20);
+
+  const state = await send(MESSAGE_TYPES.GET_TAB_STATE, { tabId });
+  assert.equal(state.data.state, 'active');
+  assert.equal(state.data.backend, 'page-audio');
+  assert.equal(pageGainFor(tabId), 210, 'the new saved route receives its own preference');
   assert.equal(tabCaptureCalls, 0);
 });
 

@@ -16,6 +16,7 @@ import {
   isTerminalFailureState,
   BRIDGE_COMMANDS,
   isValidBridgeCommand,
+  isValidPageAudioSnapshot,
   gainValueFromPercent,
   classifyMediaElement,
   summarizeDocumentState,
@@ -78,6 +79,26 @@ test('policy: a bridge command must carry an operation token and a valid gain wh
   assert.equal(isValidBridgeCommand({ type: 'EVALUATE', operationToken: token, code: 'x' }), false, 'no generic execution');
   assert.equal(isValidBridgeCommand(null), false);
   assert.equal(isValidBridgeCommand('SET_GAIN'), false);
+});
+
+test('policy: MAIN-world snapshots are fully validated before service-worker use', () => {
+  const token = 'op-1';
+  const valid = {
+    state: PAGE_AUDIO_STATES.ACTIVE_WITH_MEDIA,
+    gainPercent: 175,
+    attachedCount: 1,
+    refusals: [],
+    contextState: 'running',
+    operationToken: token,
+    reinstallCount: 0,
+  };
+  assert.equal(isValidPageAudioSnapshot(valid, token), true);
+  assert.equal(isValidPageAudioSnapshot({ ...valid, operationToken: 'stale' }, token), false);
+  assert.equal(isValidPageAudioSnapshot({ ...valid, state: 'active' }, token), false);
+  assert.equal(isValidPageAudioSnapshot({ ...valid, gainPercent: 999 }, token), false);
+  assert.equal(isValidPageAudioSnapshot({ ...valid, attachedCount: -1 }, token), false);
+  assert.equal(isValidPageAudioSnapshot({ ...valid, refusals: ['MADE_UP'] }, token), false);
+  assert.equal(isValidPageAudioSnapshot(null, token), false);
 });
 
 // ===========================================================================

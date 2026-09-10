@@ -46,6 +46,13 @@ test('buildExportPayload: never mutates the input map', () => {
   assert.equal(JSON.stringify(savedPages), before);
 });
 
+test('buildExportPayload: preserves a broad saved-rule scope', () => {
+  const payload = buildExportPayload({
+    'https://stream.example/series/science-fiction': { ...rec(175), matchMode: 'path' },
+  });
+  assert.equal(payload.pages[0].matchMode, 'path');
+});
+
 // ===========================================================================
 // extractRawImportEntries
 // ===========================================================================
@@ -115,6 +122,15 @@ test('sanitizeImportEntries: mistyped optional fields are dropped rather than pa
   assert.equal(entries[0].volumePercent, undefined);
   assert.equal(entries[0].titleSnapshot, undefined);
   assert.equal(entries[0].customName, undefined);
+});
+
+test('sanitizeImportEntries: keeps valid scopes and drops unknown scopes', () => {
+  const { entries } = sanitizeImportEntries([
+    { pageKey: 'https://a.example/', matchMode: 'site' },
+    { pageKey: 'https://b.example/', matchMode: 'wildcard' },
+  ]);
+  assert.equal(entries[0].matchMode, 'site');
+  assert.equal(entries[1].matchMode, undefined);
 });
 
 test('sanitizeImportEntries: bounds the result to maxCount, reporting how many were dropped by the cap', () => {

@@ -11,13 +11,17 @@ description of the problem and the steps to reproduce it is enough.
 
 ## Security model
 
-This extension is local-only. There is no server, no account, no API key, and
-no network request of any kind, so there is no remote attack surface to
-protect. The realistic risk surface is entirely local:
+This extension is local-only. There is no server, account, API key, or network
+request initiated by the extension. Its relevant risk surfaces are local state
+and the untrusted web pages where fullscreen-compatible audio runs:
 
 - Something with access to your Chrome profile directory could read
-  `chrome.storage.local` and see which exact page URLs you have saved.
+  `chrome.storage.local` and see which URL rules you have saved.
 - A bug in this extension could misuse a capability it already holds.
+- A hostile page can observe or interfere with objects and DOM events in its
+  own MAIN world. It can disrupt its own audio processing or make the displayed
+  page-audio status unreliable, but that channel exposes no extension API,
+  storage access, saved URL, tab ID, or compatibility-capture permission.
 
 Design decisions that follow from that:
 
@@ -27,6 +31,11 @@ Design decisions that follow from that:
 - **Every message is validated by both target and type**, and by the sender
   context allowed to send it. A message addressed to one component can never be
   validated against another component's payload shape.
+- **MAIN-world replies are untrusted.** The service worker validates the full
+  controller snapshot, including its operation token and bounded fields, before
+  it updates derived session state. This limits malformed or forged replies,
+  although no extension can stop a page from sabotaging code running in that
+  page's own MAIN world.
 - **Capture teardown is fail-closed.** The extension never reports a tab as
   silent unless the offscreen document positively confirmed that its audio
   graph was torn down; if that cannot be confirmed, it escalates to an
@@ -35,7 +44,7 @@ Design decisions that follow from that:
   message cannot affect a newer session that happens to share the same tab.
 - **URLs with embedded credentials are rejected** and can never be saved.
 
-## Exact URLs can be sensitive
+## Saved URLs can be sensitive
 
 A page's exact URL can embed access tokens, session identifiers, document IDs,
 search queries, or other private information. This extension never transmits a
@@ -55,8 +64,8 @@ or `externally_connectable`. See the README for what each one is for.
 
 `host_permissions` is what lets a saved page resume its boost automatically:
 when a top-level page finishes loading, the extension canonicalizes its URL
-and checks it against the pages you have saved locally, and — only on an exact
-match — injects the packaged audio engine to reapply your saved volume. This
+ and checks it against the rules you have saved locally, and only on a valid
+ local match injects the packaged audio engine to reapply your saved volume. This
 necessarily relaxes the previous "a tab's URL is never read until it is already
 boosting" property: a committed top-level URL is now read to be matched against
 local storage. It is matched only through the single canonical matcher in
