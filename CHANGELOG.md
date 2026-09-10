@@ -4,6 +4,12 @@ User-visible changes only.
 
 ## Unreleased
 
+## 0.6.1 - 2026-09-11
+
+- Simplified manual URL entry with an Automatic scope that recognizes clean
+  website roots and fragment-based page or episode URLs, while retaining
+  explicit scope overrides.
+
 ## 0.6.0 - 2026-09-11
 
 - Added direct URL entry to the Saved pages view, with exact-address, page,

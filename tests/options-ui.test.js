@@ -161,10 +161,11 @@ test('import: lists larger than one message are sent in bounded batches instead 
   assert.doesNotMatch(js, /sanitizeImportEntries\(rawEntries,\s*MAX_BULK_PAGE_KEYS\)/);
 });
 
-test('saved rules: the options page has a direct URL form with all four matching scopes', () => {
+test('saved rules: the options page defaults to automatic and keeps all four manual scopes', () => {
   const markup = html();
   assert.match(markup, /id="add-rule-form"/);
   assert.match(markup, /id="add-url-input"[^>]*type="url"/);
+  assert.match(markup, /<option value="auto" selected>Automatic \(recommended\)<\/option>/);
   for (const mode of ['exact', 'page', 'path', 'site']) {
     assert.match(markup, new RegExp(`<option value="${mode}">`));
   }
@@ -173,7 +174,8 @@ test('saved rules: the options page has a direct URL form with all four matching
 test('saved rules: submitting the options form sends its selected match mode without opening the URL', () => {
   const source = js();
   assert.match(source, /els\.addRuleForm\.addEventListener\('submit'/);
-  assert.match(source, /matchMode:\s*els\.addScopeSelect\.value/);
+  assert.match(source, /matchMode:\s*selectedMatchMode\(\)/);
+  assert.match(source, /inferSavedPageMatchMode/);
   assert.match(source, /MESSAGE_TYPES\.ADD_PAGE_MANUAL/);
   assert.doesNotMatch(source, /window\.open|chrome\.tabs\.create/);
 });

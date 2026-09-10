@@ -30,11 +30,15 @@
     <label class="options__field" for="add-scope-select">
       <span>Apply to</span>
       <select id="add-scope-select">
+        <option value="auto" selected>Automatic (recommended)</option>
         <option value="exact">Only this exact address</option>
         <option value="page">This page, including episode fragments</option>
         <option value="path">This section and its subpages</option>
         <option value="site">The entire website</option>
       </select>
+      <small id="add-scope-hint" class="options__field-hint" aria-live="polite">
+        Paste a URL to see the automatic scope.
+      </small>
     </label>
     <label class="options__field" for="add-name-input">
       <span>Local name (optional)</span>

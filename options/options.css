@@ -148,6 +148,12 @@ h1 {
   color: var(--fg);
 }
 
+.options__field-hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .options__volume-input-row {
   display: flex;
   align-items: center;

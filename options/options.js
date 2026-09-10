@@ -27,6 +27,7 @@ import { createNotificationController } from '../shared/notifications.js';
 import { getDisplayName } from '../shared/saved-page-metadata.js';
 import { filterSavedPageKeys } from '../shared/saved-pages-search.js';
 import { buildExportPayload, extractRawImportEntries, sanitizeImportEntries } from '../shared/saved-pages-import.js';
+import { inferSavedPageMatchMode } from '../shared/saved-page-rules.js';
 import {
   selectAllVisible,
   deselectAllVisible,
@@ -68,6 +69,7 @@ const els = {
   addRuleForm: document.getElementById('add-rule-form'),
   addUrlInput: document.getElementById('add-url-input'),
   addScopeSelect: document.getElementById('add-scope-select'),
+  addScopeHint: document.getElementById('add-scope-hint'),
   addNameInput: document.getElementById('add-name-input'),
   addVolumeInput: document.getElementById('add-volume-input'),
   addVolumeOutput: document.getElementById('add-volume-output'),
@@ -396,12 +398,35 @@ els.addVolumeInput.addEventListener('input', () => {
   els.addVolumeOutput.textContent = `${els.addVolumeInput.value}%`;
 });
 
+function selectedMatchMode() {
+  return els.addScopeSelect.value === 'auto'
+    ? inferSavedPageMatchMode(els.addUrlInput.value.trim())
+    : els.addScopeSelect.value;
+}
+
+function renderAutomaticScopeHint() {
+  if (els.addScopeSelect.value !== 'auto') {
+    els.addScopeHint.textContent = 'Manual scope selected.';
+    return;
+  }
+  const rawUrl = els.addUrlInput.value.trim();
+  if (!rawUrl) {
+    els.addScopeHint.textContent = 'Paste a URL to see the automatic scope.';
+    return;
+  }
+  const mode = inferSavedPageMatchMode(rawUrl);
+  els.addScopeHint.textContent = `Automatic scope: ${MATCH_MODE_LABELS[mode]}.`;
+}
+
+els.addUrlInput.addEventListener('input', renderAutomaticScopeHint);
+els.addScopeSelect.addEventListener('change', renderAutomaticScopeHint);
+
 els.addRuleForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   clearStatus();
   const response = await sendMessage(TARGETS.SERVICE_WORKER, MESSAGE_TYPES.ADD_PAGE_MANUAL, {
     rawUrl: els.addUrlInput.value.trim(),
-    matchMode: els.addScopeSelect.value,
+    matchMode: selectedMatchMode(),
     gainPercent: Number(els.addVolumeInput.value),
     customName: els.addNameInput.value,
   });
@@ -411,6 +436,7 @@ els.addRuleForm.addEventListener('submit', async (event) => {
   }
   els.addUrlInput.value = '';
   els.addNameInput.value = '';
+  renderAutomaticScopeHint();
   setStatus('Saved rule added.');
   await refresh();
 });

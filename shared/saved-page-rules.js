@@ -20,6 +20,23 @@ export function normalizeSavedPageMatchMode(value) {
   return isValidSavedPageMatchMode(value) ? value : SAVED_PAGE_MATCH_MODES.EXACT;
 }
 
+/**
+ * Chooses a conservative default for the manual-add form. A clean origin root
+ * means the whole site. Every other valid URL becomes a page rule, which keeps
+ * its path and query but also covers fragment-based episode/player state.
+ * Section rules remain an explicit choice because an extensionless path alone
+ * cannot reliably reveal whether it is a category or one content page.
+ */
+export function inferSavedPageMatchMode(rawUrl) {
+  const canonical = canonicalizePageKey(rawUrl);
+  if (!canonical.ok) return SAVED_PAGE_MATCH_MODES.EXACT;
+  const url = new URL(canonical.pageKey);
+  if (url.pathname === '/' && url.search === '' && url.hash === '') {
+    return SAVED_PAGE_MATCH_MODES.SITE;
+  }
+  return SAVED_PAGE_MATCH_MODES.PAGE;
+}
+
 function trimTrailingPathSlashes(pathname) {
   if (pathname === '/') return pathname;
   let end = pathname.length;

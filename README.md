@@ -56,6 +56,10 @@ This extension is not published to the Chrome Web Store; load it unpacked.
 
 - **Add an address** lets you paste a URL and choose its scope: exact address,
   page and episode fragments, section and subpages, or the entire website.
+  **Automatic** is selected by default: a clean website root becomes an
+  entire-site rule, while other URLs become page rules that also cover
+  fragment-based player or episode state. Manual scopes remain available when
+  you need a narrower exact address or a broader section.
 - **Search** filters the list locally by name, title, hostname, URL, path,
   query, or fragment. Multi-word queries match in any order.
 - Each row has a checkbox, a volume slider, **Rename**, and an individual

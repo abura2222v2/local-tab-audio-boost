@@ -3,12 +3,20 @@ import assert from 'node:assert/strict';
 import { SAVED_PAGE_MATCH_MODES } from '../shared/constants.js';
 import {
   canonicalizeSavedPageRule,
+  inferSavedPageMatchMode,
   savedPageRuleMatches,
   findSavedPageMatch,
 } from '../shared/saved-page-rules.js';
 
 const EPISODE = 'https://stream.example/series/science-fiction/snow-train.html#season:2-episode:10';
 const TITLE_PAGE = 'https://stream.example/series/science-fiction/snow-train.html';
+
+test('rules: automatic scope treats a clean origin as a site and other URLs as fragment-aware pages', () => {
+  assert.equal(inferSavedPageMatchMode('https://stream.example/'), SAVED_PAGE_MATCH_MODES.SITE);
+  assert.equal(inferSavedPageMatchMode(TITLE_PAGE), SAVED_PAGE_MATCH_MODES.PAGE);
+  assert.equal(inferSavedPageMatchMode(EPISODE), SAVED_PAGE_MATCH_MODES.PAGE);
+  assert.equal(inferSavedPageMatchMode('not a url'), SAVED_PAGE_MATCH_MODES.EXACT);
+});
 
 test('rules: exact preserves the episode fragment and matches only that address', () => {
   const rule = canonicalizeSavedPageRule(EPISODE, SAVED_PAGE_MATCH_MODES.EXACT);
